@@ -64,10 +64,33 @@
 //!   frustum (`ShadowSettings::fitted_cascades`), which with
 //!   `ORRIN_PERF_MOTION` is what a view that cannot be kept between frames
 //!   costs beside one that can.
+//! - `ORRIN_PERF_RAYS=1` traces the scene: the acceleration structures are
+//!   built — the scene's every frame — and the instance view is drawn from one
+//!   ray per pixel. What keeping a traceable scene costs, and one full-screen
+//!   trace of it. Nothing on a device that cannot trace, or under
+//!   `ORRIN_RAY_TRACING=0`.
+//! - `ORRIN_PERF_GI=1` lights the frame with the irradiance volumes at their
+//!   defaults: the four dispatches that trace and update a cascade a frame and
+//!   shade the radiance cache, and every pass that lights a surface reading
+//!   them. Their rows are `gi_trace`, `gi_cache_compact`, `gi_update` and
+//!   `gi_cache_shade`; what reading them costs is the `forward` row against a
+//!   run without. Nothing on a device that cannot trace. The final gather is
+//!   off under this alone.
+//! - `ORRIN_PERF_GI_GATHER=half` (or `quarter`) adds the final gather to
+//!   `ORRIN_PERF_GI`, at that share of the frame each way: the rows
+//!   `gi_gather`, `gi_gather_temporal`, the four `gi_gather_blur_*` and
+//!   `gi_gather_upscale`, and the cells it adds to `gi_cache_shade`.
 //! - `ORRIN_PERF_MSAA=1` rasterises the forward pass at four samples. The other
 //!   half of the comparison `TaaSettings::msaa` exists for: multisampled, the
 //!   pass writes and resolves its own targets and cannot depth-test `EQUAL`
 //!   against the prepass, so it rasterises every triangle a second time.
+//! - `ORRIN_PERF_UPSCALE` is `quality`, `balanced`, `performance` or `ultra`:
+//!   the scene rendered at that fraction of `ORRIN_PERF_EXTENT` and the
+//!   temporal resolve bringing it up. Every pass up to the resolve is then
+//!   that much smaller, and the resolve and everything after it are not.
+//! - `ORRIN_PERF_UPSCALER=fsr` resolves through AMD FSR, in a build with the
+//!   `fsr` feature and its runtime found (see `gfx/vulkan/upscaler.rs`); the
+//!   `taa_resolve` row is then FSR's. What ran is printed with the memory.
 //!
 //! Per-pass GPU timing serialises adjacent nodes that would otherwise overlap
 //! (see `profile::gpu_passes_enabled`), so the GPU rows are a breakdown, not a
@@ -87,7 +110,7 @@ use orrin_core::scene::{
     BloomSettings, Camera, ContactShadowSettings, Culling, DecalSettings, DofSettings,
     EnvironmentSettings, FogSettings, HdrSettings, MeshHandle, MotionBlurSettings,
     RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
-    TransparencySettings,
+    TransparencySettings, Upscaling,
 };
 use orrin_core::systems::{self, FrameGeometry};
 use orrin_ecs::World;
@@ -288,6 +311,21 @@ fn frame_cost() {
     world.insert_resource(RefractionSettings::default());
     world.insert_resource(TaaSettings {
         msaa: env_usize("ORRIN_PERF_MSAA", 0) != 0,
+        upscaling: match std::env::var("ORRIN_PERF_UPSCALE").as_deref() {
+            Ok("quality") => Upscaling::Quality,
+            Ok("balanced") => Upscaling::Balanced,
+            Ok("performance") => Upscaling::Performance,
+            Ok("ultra") => Upscaling::UltraPerformance,
+            Ok(other) => panic!(
+                "ORRIN_PERF_UPSCALE is quality, balanced, performance or ultra, not `{other}`"
+            ),
+            Err(_) => Upscaling::Native,
+        },
+        upscaler: match std::env::var("ORRIN_PERF_UPSCALER").as_deref() {
+            Ok("fsr") => orrin_core::scene::Upscaler::Fsr,
+            Ok("builtin") | Err(_) => orrin_core::scene::Upscaler::BuiltIn,
+            Ok(other) => panic!("ORRIN_PERF_UPSCALER is fsr or builtin, not `{other}`"),
+        },
         ..TaaSettings::default()
     });
     world.insert_resource(Culling::default());
@@ -296,6 +334,27 @@ fn frame_cost() {
         fitted_cascades: env_usize("ORRIN_PERF_FITTED", 0) as u32,
         ..ShadowSettings::default()
     });
+
+    if env_usize("ORRIN_PERF_RAYS", 0) != 0 {
+        renderer.set_ray_tracing(orrin_core::scene::RayTracingSettings {
+            debug_view: orrin_core::scene::RayDebugView::Instance,
+            ..Default::default()
+        });
+    }
+
+    if env_usize("ORRIN_PERF_GI", 0) != 0 {
+        use orrin_core::scene::{GiGatherResolution, GiSettings};
+        let gather = match std::env::var("ORRIN_PERF_GI_GATHER").as_deref() {
+            Ok("half") => Some(GiGatherResolution::Half),
+            Ok("quarter") => Some(GiGatherResolution::Quarter),
+            _ => None,
+        };
+        renderer.set_gi(GiSettings {
+            gather: gather.is_some(),
+            gather_resolution: gather.unwrap_or_default(),
+            ..GiSettings::default()
+        });
+    }
 
     let mut lighting = SceneLighting::default();
     let mut geometry = FrameGeometry::default();
@@ -460,6 +519,31 @@ fn frame_cost() {
             "     {:<28} not reported by this driver",
             "device-local memory"
         ),
+    }
+    let upscaler = renderer.upscaler_status();
+    println!(
+        "     {:<28} {:?}{}{}",
+        "temporal resolve",
+        upscaler.running,
+        upscaler
+            .provider
+            .as_ref()
+            .map_or(String::new(), |provider| format!(", {provider}")),
+        upscaler.memory_bytes.map_or(String::new(), |bytes| format!(
+            ", {:.1} MB",
+            bytes as f64 / 1e6
+        )),
+    );
+    if let Some(reason) = &upscaler.reason {
+        println!("     {:<28} {reason}", "");
+    }
+    let traced = renderer.traced_scene_bytes();
+    if traced > 0 {
+        println!(
+            "     {:<28} {:>9.1} MB",
+            "acceleration structures",
+            traced as f64 / 1e6,
+        );
     }
     for lane in [Lane::Cpu, Lane::Gpu] {
         let mut rows = profiler.aggregate(lane);

@@ -27,6 +27,7 @@ layout(push_constant) uniform Push {
     // under reversed Z, so an edge wins against its own face at every
     // distance by the same fraction of it.
     float nudge;
+    vec2 depth_scale;
 } push;
 
 layout(location = 0) out vec3 v_corner;

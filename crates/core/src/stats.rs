@@ -21,6 +21,7 @@ pub struct FrameStats {
     gpu_ms_history: VecDeque<f32>,
     vram_used: Option<u64>,
     vram_total: u64,
+    traced_scene_bytes: u64,
     device: Option<String>,
     run_banner: Option<String>,
 }
@@ -45,6 +46,7 @@ impl FrameStats {
             gpu_ms_history: VecDeque::with_capacity(HISTORY),
             vram_used: None,
             vram_total: 0,
+            traced_scene_bytes: 0,
             device: None,
             run_banner: None,
         }
@@ -128,6 +130,16 @@ impl FrameStats {
 
     pub fn vram_total(&self) -> u64 {
         self.vram_total
+    }
+
+    /// The share of the used memory that is acceleration structures: zero
+    /// until something traces.
+    pub fn traced_scene_bytes(&self) -> u64 {
+        self.traced_scene_bytes
+    }
+
+    pub fn set_traced_scene_bytes(&mut self, bytes: u64) {
+        self.traced_scene_bytes = bytes;
     }
 
     pub fn fps(&self) -> f32 {

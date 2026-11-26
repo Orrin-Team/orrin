@@ -53,6 +53,7 @@ bitflags! {
         const BOTTOM_OF_PIPE = 1 << 10;
         const HOST = 1 << 11;
         const ALL_COMMANDS = 1 << 12;
+        const ACCELERATION_STRUCTURE_BUILD = 1 << 13;
     }
 }
 
@@ -72,6 +73,8 @@ bitflags! {
         const DEPTH_STENCIL_ATTACHMENT_WRITE = 1 << 10;
         const TRANSFER_READ = 1 << 11;
         const TRANSFER_WRITE = 1 << 12;
+        const ACCELERATION_STRUCTURE_READ = 1 << 13;
+        const ACCELERATION_STRUCTURE_WRITE = 1 << 14;
     }
 }
 

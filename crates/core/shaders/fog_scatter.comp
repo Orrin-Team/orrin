@@ -12,6 +12,7 @@
 // sixty-four planes; with it the volume resolves finer than its own slice count,
 // for the reason TAA resolves finer than its own pixel grid.
 
+#define ORRIN_FOG_LIGHT
 #include "fog.glsl"
 
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
@@ -36,6 +37,17 @@ layout(set = 0, binding = 2) uniform samplerShadow u_shadow_cmp;
 layout(set = 0, binding = 3) uniform sampler3D u_history;
 
 layout(set = 0, binding = 4, rgba16f) uniform writeonly image3D u_scatter;
+
+// The irradiance volumes' block, or its inert stand-in, for whether they are
+// live and asked to light the fog; and where they are, the light the air
+// scatters from everything but the sun, traced from the air itself
+// (`fog_light.comp`) on a grid half the froxels' a side and in depth, or a
+// texel of nothing where it is not.
+#define ORRIN_GI_SET 0
+#define ORRIN_GI_BLOCK_BINDING 5
+#define ORRIN_GI_PROBES_BINDING 6
+#include "gi.glsl"
+layout(set = 0, binding = 10) uniform sampler3D u_air;
 
 void main() {
     ivec3 size = imageSize(u_scatter);
@@ -69,6 +81,24 @@ void main() {
     // `rgb` is scattered radiance per metre and `a` is extinction per metre, so
     // the pass below can integrate the two together over a slice's own length.
     vec4 current = vec4(density * fog_inscattered(f, dir, sun_visibility), density);
+    // The flat ambient taken back out and the traced light put in: the air in
+    // a closed room is as dark as its walls, and the air of an aisle beside a
+    // sunlit court is lit by what it sees of the court. Added rather than
+    // folded into the line above, which then stays the frame it was where the
+    // volumes are off.
+    //
+    // Not the volumes' mean radiance at the point: their probes are a metre
+    // apart near the camera and four at twenty metres, where an aisle three
+    // metres wide has none of its own, and the air there was lit by probes
+    // in the court through the arches. `gfx/vulkan/fog.rs` has the numbers.
+    // Where no cell round the point holds light — air the camera sees only
+    // at a wall's face, jittered into it — the froxel keeps its history.
+    float keep = f.temporal.x;
+    if (gi_live() && gi.environment.z > 0.5) {
+        vec4 light = fog_light_at(u_air, vec3(uv, t));
+        current.rgb += density * f.albedo.rgb * (light.rgb - f.ambient.rgb);
+        keep = light.a > 0.0 ? keep : 1.0;
+    }
 
     if (f.temporal.z < 0.5) {
         vec4 clip = f.prev_view_proj * vec4(world_pos, 1.0);
@@ -83,7 +113,7 @@ void main() {
             if (all(greaterThanEqual(prev_uv, vec2(0.0)))
                 && all(lessThanEqual(prev_uv, vec2(1.0)))) {
                 vec4 history = textureLod(u_history, prev, 0.0);
-                current = mix(current, history, f.temporal.x);
+                current = mix(current, history, keep);
             }
         }
     }

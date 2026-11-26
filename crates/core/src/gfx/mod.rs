@@ -5,8 +5,10 @@ pub mod format;
 pub mod graph;
 pub mod headless;
 pub mod images;
+pub mod light_grid;
 #[cfg(target_os = "macos")]
 pub mod metal;
+pub mod probes;
 pub mod punctual;
 pub mod rhi;
 pub mod sh;

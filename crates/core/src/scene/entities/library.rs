@@ -612,7 +612,7 @@ pub fn load_library(
 /// Upload a material and register it in every world-side table at once, so a
 /// material can never reach a draw list without the blend mode extraction sorts
 /// it by — a blended one registered nowhere would draw as an opaque wall.
-fn load_material(
+pub(super) fn load_material(
     backend: &mut impl RenderBackend,
     assets: &mut Assets,
     blends: &mut MaterialBlends,

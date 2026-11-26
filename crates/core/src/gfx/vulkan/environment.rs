@@ -176,6 +176,7 @@ impl EnvironmentPass {
             compare: false,
             anisotropy: None,
             max_lod: None,
+            lod_bias: 0.0,
         });
 
         // Repeat in u so the seam wraps, clamp in v so the poles do not fold
@@ -187,6 +188,7 @@ impl EnvironmentPass {
             compare: false,
             anisotropy: None,
             max_lod: Some(0.0),
+            lod_bias: 0.0,
         });
 
         Self {

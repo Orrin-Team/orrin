@@ -151,6 +151,7 @@ impl UiPass {
                 compare: false,
                 anisotropy: None,
                 max_lod: None,
+                lod_bias: 0.0,
             }),
             atlas: None,
             textures: None,

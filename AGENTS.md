@@ -106,7 +106,8 @@ cargo test -p orrin-core --test cold_start -- --nocapture
 
 Useful environment variables (full list in each harness's module docs):
 `ORRIN_SCENE`, `ORRIN_STRESS`, `ORRIN_THREADS`, `ORRIN_VALIDATION`, `ORRIN_LOG`,
-`ORRIN_PERF_*`, `ORRIN_UPDATE_GOLDEN`, `ORRIN_COLD_START_BUDGET_MS`.
+`ORRIN_PERF_*`, `ORRIN_CAPTURE`, `ORRIN_RAY_TRACING`, `ORRIN_UPDATE_GOLDEN`,
+`ORRIN_COLD_START_BUDGET_MS`.
 
 CI (`.github/workflows/rust.yml`) runs: workspace build, workspace test, the
 `--no-default-features` check, the exported-game check, both C# builds, the C# math/ABI tests, and the

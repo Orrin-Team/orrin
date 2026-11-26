@@ -39,6 +39,8 @@ pub enum ResourceKind {
     Sampler,
     StorageImage,
     CombinedImageSampler,
+    /// What a ray query traces against.
+    AccelerationStructure,
 }
 
 /// One binding in one descriptor set. `count` is the array length, one for a

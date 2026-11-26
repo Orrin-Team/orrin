@@ -399,6 +399,7 @@ impl MaterialPreviewPass {
             compare: false,
             anisotropy: None,
             max_lod: Some(0.0),
+            lod_bias: 0.0,
         });
         let mesh = CpuMesh::sphere(SECTORS, STACKS);
         let (sphere, _) = device.upload_mesh(&mesh.vertices, &mesh.indices);

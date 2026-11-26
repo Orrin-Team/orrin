@@ -55,6 +55,8 @@ pub enum ResourceKind {
     Sampler,
     StorageImage,
     CombinedImageSampler,
+    /// What a ray query traces against.
+    AccelerationStructure,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -168,6 +170,10 @@ fn reflect_resources(
         (
             ResourceType::SampledImage,
             ResourceKind::CombinedImageSampler,
+        ),
+        (
+            ResourceType::AccelerationStructure,
+            ResourceKind::AccelerationStructure,
         ),
     ];
     for (ty, kind) in kinds {

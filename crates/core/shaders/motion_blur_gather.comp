@@ -49,7 +49,8 @@ float linear_depth(float d) {
 // Identical to the tile pass's, and it has to be: a pixel whose sky motion this
 // disagreed about would gather along one vector and be weighted against another.
 vec2 blur_vector(ivec2 at, ivec2 size) {
-    float depth = texelFetch(u_depth, at, 0).r;
+    ivec2 under = texel_under(at, size, textureSize(u_depth, 0));
+    float depth = texelFetch(u_depth, under, 0).r;
     vec2 uv = (vec2(at) + 0.5) / vec2(size);
 
     vec2 velocity;
@@ -58,7 +59,7 @@ vec2 blur_vector(ivec2 at, ivec2 size) {
         vec4 previous = mb.prev_view_proj * vec4(world.xyz / world.w, 1.0);
         velocity = uv - ((previous.xy / previous.w) * 0.5 + 0.5);
     } else {
-        velocity = texelFetch(u_velocity, at, 0).rg;
+        velocity = texelFetch(u_velocity, under, 0).rg;
     }
 
     vec2 pixels = velocity * vec2(size) * mb.params.x;
@@ -111,7 +112,8 @@ void main() {
         return;
     }
 
-    float center_depth = linear_depth(texelFetch(u_depth, texel, 0).r);
+    ivec2 depth_size = textureSize(u_depth, 0);
+    float center_depth = linear_depth(texelFetch(u_depth, texel_under(texel, size, depth_size), 0).r);
     // Floored at half a pixel so a stationary centre still divides: a pixel with
     // no motion of its own is exactly the case this pass exists to serve, since
     // it is the background a moving object sweeps over.
@@ -128,7 +130,7 @@ void main() {
         float t = (float(i) + 0.5 + jitter) / float(TAPS) - 0.5;
         ivec2 at = clamp(texel + ivec2(round(dominant * t)), ivec2(0), size - 1);
 
-        float sample_depth = linear_depth(texelFetch(u_depth, at, 0).r);
+        float sample_depth = linear_depth(texelFetch(u_depth, texel_under(at, size, depth_size), 0).r);
         float sample_speed = max(length(blur_vector(at, size)), 0.5);
         float distance = abs(t) * dominant_speed;
 

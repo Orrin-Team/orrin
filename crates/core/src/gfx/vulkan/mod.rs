@@ -1,9 +1,12 @@
+mod accel;
 mod bloom;
 mod contact_shadows;
 mod context;
 mod convert;
 mod cull;
 mod descriptors;
+#[cfg(all(feature = "dlss", windows))]
+mod dlss;
 mod dof;
 pub mod driver;
 mod environment;
@@ -11,6 +14,10 @@ mod exposure;
 mod fog;
 mod forward;
 pub mod frame;
+#[cfg(all(feature = "fsr", windows))]
+mod fsr;
+mod gi;
+mod gi_gather;
 pub(crate) mod gizmo;
 pub(crate) mod hdr;
 mod instances;
@@ -25,6 +32,7 @@ mod overlay;
 mod parallel;
 mod pipeline_cache;
 mod prepass;
+mod raytrace;
 mod record;
 mod refraction;
 mod rendering;
@@ -41,6 +49,7 @@ mod timestamps;
 mod ui;
 mod ui_window;
 mod upload;
+mod upscaler;
 mod vendor;
 pub mod wireframe;
 
@@ -84,7 +93,7 @@ use self::instances::InstanceStore;
 use self::occlusion::OcclusionPass;
 use self::oit::OitPass;
 use self::refraction::RefractionPass;
-use crate::gfx::graph::{PassKind, Queue as GraphQueue, ResourceId};
+use crate::gfx::graph::{Extents, PassKind, Queue as GraphQueue, ResourceId};
 
 use self::bloom::BloomPass;
 use self::dof::DofPass;
@@ -171,6 +180,7 @@ pub(crate) const MSAA_SAMPLES: crate::gfx::format::SampleCount =
 pub(crate) const OFFSCREEN_FORMAT: crate::gfx::format::Format =
     crate::gfx::format::Format::Rgba8Srgb;
 
+pub use context::upscaler_instance_extensions;
 pub use cull::MAX_SURFACE_SHADERS;
 pub use gizmo::GizmoVertex;
 pub use outline::OutlineItem;
@@ -379,6 +389,28 @@ pub struct VulkanRenderer {
     /// Each material's blend mode, by handle: which queue draws it, and so
     /// which twins a surface shader reading it needs.
     blends: Vec<crate::gfx::BlendMode>,
+    /// What the frame traces rays for. `None` on a device that cannot trace,
+    /// where nothing of it is built. See `raytrace`.
+    raytrace: Option<raytrace::RayTracePass>,
+    /// What the next frame traces, as [`set_ray_tracing`](Self::set_ray_tracing)
+    /// last left it.
+    ray_settings: crate::scene::RayTracingSettings,
+    /// The irradiance volumes, or on a device that cannot trace their inert
+    /// stand-ins alone. See `gi`.
+    gi: gi::GiPass,
+    /// What the next frame's volumes are, as [`set_gi`](Self::set_gi) last left
+    /// them. Off until then, so a harness that never asks draws the frame it
+    /// always did.
+    gi_settings: crate::scene::GiSettings,
+    /// The mode the material texture sets were last built for, and a sampler
+    /// per mode that has been used, each with that mode's level-of-detail
+    /// bias. A handful at most, and kept: a device sampler is not something
+    /// the RHI frees.
+    texture_bias: crate::scene::Upscaling,
+    biased_samplers: Vec<(crate::scene::Upscaling, crate::gfx::rhi::SamplerId)>,
+    /// What resolves the frame where a vendor's upscaler is asked for, and
+    /// whether it can. See `upscaler`.
+    upscaler: upscaler::VendorUpscaler,
 }
 
 /// The frame's commands as they are being recorded: a Vulkan command buffer, or
@@ -455,15 +487,16 @@ impl Backend {
         }
     }
 
-    fn is_stale(&self) -> bool {
+    /// Whether the images were allocated at other extents than `extents`.
+    fn is_stale(&self, extents: Extents) -> bool {
         match self {
-            Backend::Vulkan(vk) => vk.images.is_stale(vk.swapchain.extent),
+            Backend::Vulkan(vk) => vk.images.is_stale(extents),
             #[cfg(target_os = "macos")]
-            Backend::Metal(mtl) => mtl.is_stale(),
+            Backend::Metal(mtl) => mtl.is_stale(extents),
         }
     }
 
-    /// The extent the frame renders at.
+    /// The extent the frame is presented at: the window's, or the capture's.
     fn extent(&self) -> [u32; 2] {
         match self {
             Backend::Vulkan(vk) => vk.swapchain.extent,
@@ -657,6 +690,12 @@ impl VulkanRenderer {
         }
         self.ui.invalidate_textures(&self.device);
         self.ui_window_invalidate_textures();
+        self.ssr.forget_textures(&self.device);
+        if let Some(raytrace) = &mut self.raytrace {
+            raytrace.forget_textures(&self.device);
+        }
+        self.gi.forget_textures(&self.device);
+        self.fog.forget_textures(&self.device);
     }
 
     pub fn new(
@@ -772,7 +811,7 @@ impl VulkanRenderer {
                     &ctx,
                     device.vulkan(),
                     &frame.graph,
-                    extent,
+                    Extents::native(extent),
                     slots,
                 );
                 let table = images.table();
@@ -819,7 +858,7 @@ impl VulkanRenderer {
         let prepass = GeometryPrepass::new(&device);
         let ssao = SsaoPass::new(&device);
         let contact_shadows = ContactShadowPass::new(&device);
-        let fog = FogPass::new(&device);
+        let fog = FogPass::new(&device, device.supports(Feature::RayTracing));
         let ssr = SsrPass::new(&device);
         let subsurface = SubsurfacePass::new(&device);
         let oit = OitPass::new(&device, forward.layout_source());
@@ -830,6 +869,10 @@ impl VulkanRenderer {
         let shadow = ShadowPass::new(&device);
         let line = LinePass::new(&device, &forward.targets);
         let environment = EnvironmentPass::new(&device, &forward.targets);
+        let raytrace = device
+            .supports(Feature::RayTracing)
+            .then(|| raytrace::RayTracePass::new(&device, format));
+        let gi = gi::GiPass::new(&device, raytrace.is_some());
         // Default textures so every material slot resolves to a valid view:
         // index 0 = white (a no-op multiply), index 1 = flat normal (0,0,1).
         let textures = vec![
@@ -867,6 +910,14 @@ impl VulkanRenderer {
             wireframe: None,
             material_preview: false,
             screenshot: None,
+            ray_tracing: false,
+            ray_debug: false,
+            ray_reflections: false,
+            ray_path_trace: false,
+            gi_probes: 0,
+            gi_gather: 0,
+            upscaling: crate::scene::Upscaling::Native,
+            vendor_resolve: false,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -927,8 +978,58 @@ impl VulkanRenderer {
             ui_window: None,
             surfaces: surface::SurfaceShaders::new(0, 1),
             blends: vec![crate::gfx::BlendMode::default()],
+            raytrace,
+            ray_settings: Default::default(),
+            gi,
+            gi_settings: crate::scene::GiSettings {
+                enabled: false,
+                ..Default::default()
+            },
+            texture_bias: crate::scene::Upscaling::Native,
+            biased_samplers: Vec::new(),
+            upscaler: upscaler::VendorUpscaler::new(),
             backend,
         }
+    }
+
+    /// Point the geometry passes' material textures at the sampler the
+    /// compiled frame's upscaling mode wants: below the output's extent a
+    /// texture is sampled at a finer level, by [`Upscaling::texture_lod_bias`],
+    /// so it is as sharp in the resolved frame as at native. Native samples
+    /// through each pass's own sampler, exactly as it did.
+    ///
+    /// [`Upscaling::texture_lod_bias`]: crate::scene::Upscaling::texture_lod_bias
+    fn follow_texture_bias(&mut self) {
+        let mode = self.config.upscaling;
+        if mode == self.texture_bias {
+            return;
+        }
+        let biased = (mode != crate::scene::Upscaling::Native).then(|| {
+            match self
+                .biased_samplers
+                .iter()
+                .find(|(other, _)| *other == mode)
+            {
+                Some(&(_, sampler)) => sampler,
+                None => {
+                    let sampler = self.device.create_sampler(crate::gfx::rhi::SamplerDesc {
+                        linear: true,
+                        mipmap_linear: true,
+                        repeat: true,
+                        compare: false,
+                        anisotropy: self.device.max_anisotropy(),
+                        max_lod: None,
+                        lod_bias: mode.texture_lod_bias(),
+                    });
+                    self.biased_samplers.push((mode, sampler));
+                    sampler
+                }
+            }
+        });
+        self.forward.set_texture_sampler(biased);
+        self.prepass.set_texture_sampler(biased);
+        self.texture_bias = mode;
+        self.invalidate_texture_sets();
     }
 
     /// Plan this frame's shadows into `shadow_plan`, from what the tracker has
@@ -992,10 +1093,43 @@ impl VulkanRenderer {
         if self.config != config {
             self.frame = frame::declare(config).expect("the engine's frame must compile");
             self.config = config;
-        } else if !self.backend.is_stale() {
+        } else if !self.backend.is_stale(self.extents()) {
             return;
         }
         self.reallocate();
+    }
+
+    /// The frame's two extents: the output's, which is the window's, and the
+    /// render's the scene is drawn at below it, which follows the compiled
+    /// frame's upscaling mode.
+    fn extents(&self) -> Extents {
+        let output = self.backend.extent();
+        Extents {
+            render: self.config.upscaling.render_extent(output),
+            output,
+        }
+    }
+
+    /// Drop the temporal resolve's history at the next frame, for a camera cut:
+    /// the frame after it shares nothing with the frames before, and the
+    /// resolve would otherwise reproject the last shot over the first frames
+    /// of the next. Nothing here detects a cut; the caller knows it made one.
+    pub fn reset_temporal_history(&self) {
+        self.taa.reset();
+    }
+
+    /// What resolved the last frame, against what was asked for, and why the
+    /// two differ where they do.
+    pub fn upscaler_status(&self) -> &crate::scene::UpscalerStatus {
+        self.upscaler.status()
+    }
+
+    /// Whether a vendor's upscaler draws its debug view over what it
+    /// resolves: FSR's shows the motion it was handed and where it judged the
+    /// history stale. Remakes the vendor's context, which has to be made
+    /// able to draw it.
+    pub fn set_upscaler_debug_view(&mut self, on: bool) {
+        self.upscaler.set_debug_view(on);
     }
 
     /// Copy the last rendered frame back to host memory as tightly packed
@@ -1366,6 +1500,16 @@ impl VulkanRenderer {
         {
             return self.fog.scatter_view();
         }
+        if let Some(fog) = self.frame.ids.fog
+            && fog.light == Some(id)
+        {
+            return self.fog.light_view();
+        }
+        if let Some(fog) = self.frame.ids.fog
+            && fog.light_state == Some(id)
+        {
+            return self.fog.light_state_view();
+        }
         if let Some(ids) = self.frame.ids.occlusion {
             if id == ids.hiz {
                 return self.occlusion.hiz_view();
@@ -1373,6 +1517,12 @@ impl VulkanRenderer {
             if id == ids.history {
                 return self.occlusion.history_view();
             }
+        }
+        if let Some(vendor) = self.frame.ids.vendor_resolve
+            && (id == vendor.exposure || id == vendor.exposure_history)
+        {
+            let (written, read) = self.upscaler.exposure_views();
+            return if id == vendor.exposure { written } else { read };
         }
         match self.frame.ids.taa {
             Some(taa) if id == taa.output => self.taa.output_view(),
@@ -1397,6 +1547,10 @@ impl VulkanRenderer {
             || id == ids.instance_index
             || id == ids.exposure
             || Some(id) == ids.histogram
+            || ids
+                .ray
+                .is_some_and(|ray| id == ray.meshes || id == ray.scene)
+            || ids.gi.is_some_and(|gi| gi.holds_buffer(id))
         {
             return Some(record::Target::Memory);
         }
@@ -1411,6 +1565,13 @@ impl VulkanRenderer {
             || Some(id) == ids.shadow_static
             || ids.material_preview.is_some_and(|p| p.output == id)
             || Some(id) == ids.screenshot
+            || ids.path.is_some_and(|path| path.sum == id)
+            || ids
+                .gi
+                .is_some_and(|gi| id == gi.irradiance || id == gi.distance)
+            || ids
+                .gather
+                .is_some_and(|gather| id == gather.history || id == gather.accumulated)
         {
             return Some(record::Target::Image(
                 self.vk_view(self.table.texture(id)).image().clone(),
@@ -1421,6 +1582,20 @@ impl VulkanRenderer {
         {
             return Some(record::Target::Image(
                 self.vk_view(self.fog.scatter_view()).image().clone(),
+            ));
+        }
+        if let Some(fog) = ids.fog
+            && fog.light == Some(id)
+        {
+            return Some(record::Target::Image(
+                self.vk_view(self.fog.light_view()).image().clone(),
+            ));
+        }
+        if let Some(fog) = ids.fog
+            && fog.light_state == Some(id)
+        {
+            return Some(record::Target::Image(
+                self.vk_view(self.fog.light_state_view()).image().clone(),
             ));
         }
         if let Some(occlusion) = ids.occlusion {
@@ -1434,6 +1609,13 @@ impl VulkanRenderer {
                     self.vk_view(self.occlusion.history_view()).image().clone(),
                 ));
             }
+        }
+        if let Some(vendor) = ids.vendor_resolve
+            && (id == vendor.exposure || id == vendor.exposure_history)
+        {
+            return Some(record::Target::Image(
+                self.vk_view(self.texture_of(id)).image().clone(),
+            ));
         }
         if let Some(taa) = ids.taa {
             if id == taa.output {
@@ -1512,6 +1694,7 @@ impl VulkanRenderer {
     }
 
     fn reallocate(&mut self) {
+        let extents = self.extents();
         // Rebuilt rather than replaced, so the image cache survives: a
         // structural toggle re-points `views` at allocations that already exist
         // instead of recreating every image in the frame. See `GraphImages`.
@@ -1523,7 +1706,7 @@ impl VulkanRenderer {
                     &vk.ctx,
                     driver,
                     &self.frame.graph,
-                    vk.swapchain.extent,
+                    extents,
                     image_slots(&self.frame.graph),
                 );
                 self.table = vk.images.table();
@@ -1533,7 +1716,7 @@ impl VulkanRenderer {
                 let crate::gfx::rhi::Device::Metal(driver) = &self.device else {
                     unreachable!("the Metal backend runs on the Metal device");
                 };
-                self.table = mtl.rebuild(driver, &self.frame.graph);
+                self.table = mtl.rebuild(driver, &self.frame.graph, extents.render);
             }
         }
         if let (Some(live), Some(cached)) =
@@ -1866,6 +2049,23 @@ impl VulkanRenderer {
     /// takes — a swapchain cannot be replaced while the frame in flight is still
     /// presenting from its images. A call that changes nothing does nothing, so
     /// the app may hand over the resource every frame without recreating one.
+    /// What the frames from here on trace rays for. Inert on a device that
+    /// cannot trace.
+    pub fn set_ray_tracing(&mut self, settings: crate::scene::RayTracingSettings) {
+        self.ray_settings = settings;
+    }
+
+    /// What the frames from here on light with the irradiance volumes. Inert
+    /// on a device that cannot trace, and where ray tracing is off.
+    pub fn set_gi(&mut self, settings: crate::scene::GiSettings) {
+        self.gi_settings = settings;
+    }
+
+    /// Whether the next frame traces and reads the irradiance volumes.
+    fn gi_live(&self) -> bool {
+        self.raytrace.is_some() && self.ray_settings.enabled && self.gi_settings.enabled
+    }
+
     pub fn set_present(&mut self, present: PresentSettings) {
         #[cfg(target_os = "macos")]
         if let Backend::Metal(mtl) = &mut self.backend {
@@ -1915,6 +2115,13 @@ impl VulkanRenderer {
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => self.device.metal().memory(),
         }
+    }
+
+    /// Bytes of that memory the acceleration structures hold: every mesh's,
+    /// and the scene's. Zero on a device that cannot trace, and until a frame
+    /// does.
+    pub fn traced_scene_bytes(&self) -> u64 {
+        self.device.ray_scene_bytes()
     }
 
     /// The API version the device supports and its name, for the editor's
@@ -2087,6 +2294,24 @@ impl VulkanRenderer {
         }
         self.plan_shadows(shadows, camera, lighting);
 
+        // Whether a vendor's upscaler can resolve this frame is part of its
+        // structure, so it is settled first.
+        let vendor_resolve = {
+            let vk = match &self.backend {
+                Backend::Vulkan(vk) => Some(&*vk.ctx),
+                #[cfg(target_os = "macos")]
+                Backend::Metal(_) => None,
+            };
+            self.upscaler.prepare(
+                &self.device,
+                vk,
+                taa,
+                self.backend.extent(),
+                hdr.manual_exposure(),
+                dt,
+            )
+        };
+
         // The frame's structure, and the only thing that recompiles the graph.
         // Everything else about this call — how many objects, which camera, what
         // exposure — flows through the same compiled schedule.
@@ -2112,7 +2337,11 @@ impl VulkanRenderer {
             // recreate every image in the frame.
             transparency: transparency.enabled && !transparent.is_empty(),
             refraction: refraction.enabled && !refractive.is_empty(),
-            taa: taa.enabled,
+            // An upscaling mode implies the resolve: a frame rendered small
+            // and never resolved would simply be small.
+            taa: taa.resolves(),
+            upscaling: taa.upscaling,
+            vendor_resolve,
             auto_exposure: hdr.auto_exposure,
             motion_blur: motion_blur.enabled,
             dof: dof.enabled,
@@ -2160,7 +2389,28 @@ impl VulkanRenderer {
                 Some(Screenshot::Asked(view)) => Some(view),
                 _ => None,
             },
+            ray_tracing: self.raytrace.is_some()
+                && (self.ray_settings.draws_debug_view()
+                    || self.ray_settings.path_traces()
+                    || self.ray_settings.traces_reflections(ssr.enabled)
+                    || self.gi_live()),
+            ray_path_trace: self.raytrace.is_some() && self.ray_settings.path_traces(),
+            ray_debug: self.raytrace.is_some() && self.ray_settings.draws_debug_view(),
+            ray_reflections: self.raytrace.is_some()
+                && self.ray_settings.traces_reflections(ssr.enabled),
+            gi_probes: if self.gi_live() {
+                self.gi_settings.held().probes
+            } else {
+                0
+            },
+            gi_gather: if self.gi_live() && self.gi_settings.gather {
+                self.gi_settings.gather_resolution.shift()
+            } else {
+                0
+            },
         });
+
+        self.follow_texture_bias();
 
         // Atlases allocated for this frame hold nothing, whatever the plan
         // expected to find in them.
@@ -2324,12 +2574,25 @@ impl VulkanRenderer {
         self.hdr.auto_exposure = hdr.auto_exposure;
         self.exposure.begin_frame(hdr, dt);
         self.bloom.begin_frame(bloom, hdr);
+        // The scene's passes are sized to `render`, and those after the
+        // resolve to the output's; see `frame` for which are which.
+        let extents = self.extents();
+        let render = extents.render;
         // Before anything records: this is where the frame's subpixel jitter is
         // chosen, and every pass that rasterises geometry has to be drawn with
         // the matrices it returns rather than deriving its own from `camera`.
         let view = self
             .taa
-            .begin_frame(&self.device, taa, camera, self.backend.extent());
+            .begin_frame(&self.device, taa, camera, extents, vendor_resolve);
+        let upscale = upscaler::FrameInputs {
+            jitter: view.jitter_pixels.to_array(),
+            render,
+            output: extents.output,
+            near: camera.near,
+            far: camera.far,
+            fov_y: camera.fov_y,
+            frame_ms: dt * 1e3,
+        };
         // Both resolve their optics against this frame's camera: the lens takes
         // its focal length from the field of view, and the shutter takes the
         // depth range it linearises with.
@@ -2340,13 +2603,12 @@ impl VulkanRenderer {
         // and the cull is told to test nothing that frame.
         let occlusion_live =
             self.occlusion
-                .begin_frame(&self.device, self.occlusion_culling, self.backend.extent());
+                .begin_frame(&self.device, self.occlusion_culling, render);
         self.dof.begin_frame(dof, camera, self.backend.extent());
         // Resolved against the camera for the reason the lens is: the kernel's
         // width in pixels is a world length divided by a view depth, so both
         // dispatches have to be handed one projection and one depth range.
-        self.subsurface
-            .begin_frame(subsurface, camera, self.backend.extent());
+        self.subsurface.begin_frame(subsurface, camera, render);
         // Reflections resolve against the camera *and* the environment: the
         // composite subtracts the environment term the forward pass added, so
         // it has to be handed the same rotation and the same tint that pass
@@ -2359,14 +2621,15 @@ impl VulkanRenderer {
                 &self.device,
                 ssr,
                 &view,
-                self.backend.extent(),
+                render,
                 self.table.mip_levels(ids.hiz),
                 environment.yaw,
                 environment::SPECULAR_MIPS,
                 self.environment.specular_tint(ambient, environment),
             );
         }
-        self.motion_blur.begin_frame(motion_blur, camera);
+        self.motion_blur
+            .begin_frame(motion_blur, camera, self.backend.extent());
         // Whether or not the two dispatches run, and that is the point: the
         // block resolved here is what every shading pass applies the fog out of,
         // and past the volume's far plane — or in a frame with no volume at all —
@@ -2376,12 +2639,14 @@ impl VulkanRenderer {
         self.fog.begin_frame(
             &self.device,
             fog,
+            self.frame.ids.fog.is_some_and(|ids| ids.light.is_some()),
+            self.gi_settings.fog,
             lighting,
             shadows,
             &view,
             camera.position,
             lighting.ambient_color * lighting.ambient_nits,
-            self.backend.extent(),
+            render,
         );
         // Sourced from the compiled frame, not from the setting: a window too
         // small for a chain leaves bloom enabled but unbuilt, and a non-zero
@@ -2523,6 +2788,8 @@ impl VulkanRenderer {
                         env_sampler: self.environment.sampler(),
                         fog_volume: self.fog.volume_or_fallback(None),
                         fog_sampler: self.fog.sampler(),
+                        gi: self.gi.fallback(),
+                        gathered: self.gi.gather.stand_in(),
                     },
                     pass.neutral(),
                     material_set,
@@ -2609,6 +2876,147 @@ impl VulkanRenderer {
                 self.ui
                     .prepare(&self.device, &mut encoder, ui, &self.textures);
             }
+        }
+
+        // After the rows are named and before anything records: the traced
+        // scene is this frame's objects, and the two build passes record what
+        // is decided here.
+        if self.frame.ids.ray.is_some()
+            && let Some(raytrace) = self.raytrace.as_mut()
+        {
+            profile_scope!("ray scene");
+            raytrace.begin_frame(
+                &self.device,
+                &self.ray_settings,
+                draws,
+                &self.meshes,
+                &self.materials,
+                lighting,
+                camera.position,
+                view.unjittered_view_proj,
+            );
+        }
+        if let (Some(ids), Some(raytrace)) = (self.frame.ids.path, self.raytrace.as_mut()) {
+            let extent = self.backend.extent();
+            // The froxel fog's medium, whether or not it is marched: the
+            // analytic tail draws the same air where it is not.
+            let air = if fog.density > 0.0 {
+                [
+                    fog.density,
+                    fog.height_falloff,
+                    fog.height,
+                    fog.anisotropy.clamp(-0.95, 0.95),
+                    fog.albedo.x,
+                    fog.albedo.y,
+                    fog.albedo.z,
+                    0.0,
+                ]
+            } else {
+                [0.0; 8]
+            };
+            let sum = raytrace.begin_path(
+                &self.device,
+                extent,
+                camera.position,
+                view.unjittered_view_proj,
+                air,
+                &self.textures,
+                self.prepass.material_sampler(),
+            );
+            self.table.import(
+                ids.sum,
+                crate::gfx::images::ImageEntry {
+                    whole: sum,
+                    levels: Vec::new(),
+                    layers: Vec::new(),
+                    extent,
+                    mip_levels: 1,
+                },
+            );
+        }
+        // Beside the traced scene and for the same reason: the four passes
+        // record what is decided here, and every pass that lights a surface
+        // binds what it leaves.
+        {
+            let ambient = lighting.ambient_color * lighting.ambient_nits;
+            self.gi.begin_frame(
+                &self.device,
+                &self.gi_settings,
+                self.frame.ids.gi.is_some(),
+                self.frame.ids.gather.is_some(),
+                camera.position,
+                self.environment.irradiance(ambient, environment),
+                environment.yaw,
+            );
+        }
+        // The final gather beside them, and for the same reason.
+        {
+            let gather = self.frame.ids.gather;
+            let accumulations = self.gi.gather.begin_frame(
+                &self.device,
+                &self.gi_settings,
+                gather.map(|_| self.gi_settings.gather_resolution.shift()),
+                &view,
+                camera.position,
+                render,
+            );
+            if let (Some(ids), Some((views, extent))) = (gather, accumulations) {
+                for (id, view) in [(ids.history, views[0]), (ids.accumulated, views[1])] {
+                    self.table.import(
+                        id,
+                        crate::gfx::images::ImageEntry {
+                            whole: view,
+                            levels: Vec::new(),
+                            layers: Vec::new(),
+                            extent,
+                            mip_levels: 1,
+                        },
+                    );
+                }
+                self.gi.gather.prepare(
+                    &self.device,
+                    &self.textures,
+                    self.prepass.material_sampler(),
+                );
+            }
+        }
+        if let (Some(ids), Some(([irradiance, distance, bounce, outlier], extent))) =
+            (self.frame.ids.gi, self.gi.atlases())
+        {
+            for (id, view) in [
+                (ids.irradiance, irradiance),
+                (ids.distance, distance),
+                (ids.bounce, bounce),
+                (ids.outlier, outlier),
+            ] {
+                self.table.import(
+                    id,
+                    crate::gfx::images::ImageEntry {
+                        whole: view,
+                        levels: Vec::new(),
+                        layers: Vec::new(),
+                        extent,
+                        mip_levels: 1,
+                    },
+                );
+            }
+            self.gi.prepare(
+                &self.device,
+                &self.textures,
+                self.prepass.material_sampler(),
+            );
+            self.fog.prepare(
+                &self.device,
+                &self.textures,
+                self.prepass.material_sampler(),
+            );
+        }
+        if self.frame.ids.ssr.is_some_and(|ids| ids.traced) {
+            self.ssr.prepare_traced(
+                &self.device,
+                &self.textures,
+                self.prepass.material_sampler(),
+            );
         }
 
         // The blended queues' draw orders, as row numbers into those rows. Still
@@ -2766,6 +3174,7 @@ impl VulkanRenderer {
         // every pass in the chain recorded what it was handed, so nothing here
         // re-derives an order.
         let scene_color = self.texture_of(self.frame.ids.scene_color);
+        let metered_color = self.texture_of(self.frame.ids.metered_color);
 
         // Against the unjittered projection: the bins are conservative by far
         // more than a subpixel, and the lookup reads `gl_FragCoord`, which the
@@ -2793,7 +3202,7 @@ impl VulkanRenderer {
             &self.device,
             lighting,
             camera,
-            self.backend.extent(),
+            render,
             ao_view,
             contact_shadow_view,
             atlas_view,
@@ -2812,6 +3221,11 @@ impl VulkanRenderer {
             self.fog
                 .volume_or_fallback(self.frame.ids.fog.map(|ids| self.table.texture(ids.volume))),
             self.fog.sampler(),
+            self.gi.views(),
+            match self.frame.ids.gather {
+                Some(ids) => self.table.texture(ids.irradiance),
+                None => self.gi.gather.stand_in(),
+            },
             surface_time,
         );
 
@@ -2819,7 +3233,6 @@ impl VulkanRenderer {
         // decides what runs next, what an image's layout is, or what has to
         // finish before what — a pass that needs a different place in the frame
         // gets there by changing its declarations, not by being moved here.
-        let extent = self.backend.extent();
         let (swapchain_view, swapchain_id) = match &self.backend {
             Backend::Vulkan(vk) => {
                 let view = vk.swapchain.image_views[image_index as usize].clone();
@@ -2916,7 +3329,8 @@ impl VulkanRenderer {
             frame: &self.frame,
             table: &self.table,
             swapchain_id,
-            extent,
+            render_extent: render,
+            output_extent: extents.output,
             bloom: &self.bloom,
             contact_shadows: &self.contact_shadows,
             dof: &self.dof,
@@ -2938,9 +3352,25 @@ impl VulkanRenderer {
             shadow: &self.shadow,
             ssao: &self.ssao,
             ssr: &self.ssr,
+            raytrace: self.raytrace.as_ref(),
+            ray_frame: self
+                .raytrace
+                .as_ref()
+                .filter(|_| self.frame.ids.ray.is_some())
+                .map(|pass| raytrace::RayFrame {
+                    pass,
+                    lights: forward_sets.lights(),
+                    materials,
+                    environment: self.environment.specular_view(),
+                    environment_sampler: self.environment.sampler(),
+                    gi: self.gi.views(),
+                }),
+            gi: &self.gi,
             subsurface: &self.subsurface,
             taa: &self.taa,
             view,
+            upscaler: &self.upscaler,
+            upscale,
             env: environment,
             draws,
             transparent,
@@ -2965,6 +3395,7 @@ impl VulkanRenderer {
             prepass_texture_set,
             decal_block,
             scene_color,
+            metered_color,
             shadow_atlas_view: atlas_view,
             debug_lines,
             gizmo_strokes: overlay
@@ -3406,7 +3837,10 @@ struct FrameRecord<'a> {
     table: &'a ImageTable,
     /// The same image as the device names it, which is what a pass binds.
     swapchain_id: TextureViewId,
-    extent: [u32; 2],
+    /// What the scene's passes are drawn at, up to the temporal resolve.
+    render_extent: [u32; 2],
+    /// What the resolve and every pass after it are drawn at.
+    output_extent: [u32; 2],
     bloom: &'a BloomPass,
     contact_shadows: &'a ContactShadowPass,
     dof: &'a DofPass,
@@ -3428,9 +3862,15 @@ struct FrameRecord<'a> {
     shadow: &'a ShadowPass,
     ssao: &'a SsaoPass,
     ssr: &'a SsrPass,
+    raytrace: Option<&'a raytrace::RayTracePass>,
+    /// What a pass that shades a ray's hits binds, in a frame that traces.
+    ray_frame: Option<raytrace::RayFrame<'a>>,
+    gi: &'a gi::GiPass,
     subsurface: &'a SubsurfacePass,
     taa: &'a TaaPass,
     view: taa::FrameView,
+    upscaler: &'a upscaler::VendorUpscaler,
+    upscale: upscaler::FrameInputs,
     /// The environment *settings*; `environment` above is the pass that draws
     /// them.
     env: &'a EnvironmentSettings,
@@ -3466,6 +3906,8 @@ struct FrameRecord<'a> {
     prepass_texture_set: BindGroupId,
     decal_block: BufferId,
     scene_color: TextureViewId,
+    /// What the exposure is metered from. See `FrameIds::metered_color`.
+    metered_color: TextureViewId,
     shadow_atlas_view: TextureViewId,
     debug_lines: &'a [DebugLine],
     gizmo_strokes: &'a [GizmoVertex],
@@ -3588,6 +4030,19 @@ impl FrameRecord<'_> {
     /// reason it is contiguous: the runs are executed in order by one primary,
     /// and there is one primary per segment.
     fn record_segment(&self, builder: &mut Recorder, segment: Range<usize>, parallel: bool) {
+        // NGX takes its calls on one thread (`upscaler.rs`), so a run that
+        // holds its node is split around it and the node recorded here.
+        if parallel
+            && self.upscaler.records_on_caller()
+            && let Some(slot) = segment.clone().find(|&slot| {
+                self.frame.bodies[self.frame.graph.order()[slot].index()] == PassBody::VendorResolve
+            })
+        {
+            self.record_segment(builder, segment.start..slot, true);
+            self.record_slot(builder, slot);
+            self.record_segment(builder, slot + 1..segment.end, true);
+            return;
+        }
         let slots = segment.len();
         let groups = threads::count().min(RECORD_GROUPS);
         if !parallel || groups < 2 || slots < 2 {
@@ -3671,6 +4126,22 @@ impl FrameRecord<'_> {
         {
             return self.fog.scatter_view();
         }
+        if let Some(fog) = self.frame.ids.fog
+            && fog.light == Some(id)
+        {
+            return self.fog.light_view();
+        }
+        if let Some(fog) = self.frame.ids.fog
+            && fog.light_state == Some(id)
+        {
+            return self.fog.light_state_view();
+        }
+        if let Some(vendor) = self.frame.ids.vendor_resolve
+            && (id == vendor.exposure || id == vendor.exposure_history)
+        {
+            let (written, read) = self.upscaler.exposure_views();
+            return if id == vendor.exposure { written } else { read };
+        }
         match self.frame.ids.taa {
             Some(taa) if id == taa.output => self.taa.output_view(),
             _ => self.table.texture(id),
@@ -3696,6 +4167,10 @@ impl FrameRecord<'_> {
             || id == ids.instance_index
             || id == ids.exposure
             || Some(id) == ids.histogram
+            || ids
+                .ray
+                .is_some_and(|ray| id == ray.meshes || id == ray.scene)
+            || ids.gi.is_some_and(|gi| gi.holds_buffer(id))
         {
             return Some(record::Target::Memory);
         }
@@ -3710,6 +4185,13 @@ impl FrameRecord<'_> {
             || Some(id) == ids.shadow_static
             || ids.material_preview.is_some_and(|p| p.output == id)
             || Some(id) == ids.screenshot
+            || ids.path.is_some_and(|path| path.sum == id)
+            || ids
+                .gi
+                .is_some_and(|gi| id == gi.irradiance || id == gi.distance)
+            || ids
+                .gather
+                .is_some_and(|gather| id == gather.history || id == gather.accumulated)
         {
             return Some(record::Target::Image(
                 self.vk_view(self.table.texture(id)).image().clone(),
@@ -3720,6 +4202,20 @@ impl FrameRecord<'_> {
         {
             return Some(record::Target::Image(
                 self.vk_view(self.fog.scatter_view()).image().clone(),
+            ));
+        }
+        if let Some(fog) = ids.fog
+            && fog.light == Some(id)
+        {
+            return Some(record::Target::Image(
+                self.vk_view(self.fog.light_view()).image().clone(),
+            ));
+        }
+        if let Some(fog) = ids.fog
+            && fog.light_state == Some(id)
+        {
+            return Some(record::Target::Image(
+                self.vk_view(self.fog.light_state_view()).image().clone(),
             ));
         }
         if let Some(occlusion) = ids.occlusion {
@@ -3733,6 +4229,13 @@ impl FrameRecord<'_> {
                     self.vk_view(self.occlusion.history_view()).image().clone(),
                 ));
             }
+        }
+        if let Some(vendor) = ids.vendor_resolve
+            && (id == vendor.exposure || id == vendor.exposure_history)
+        {
+            return Some(record::Target::Image(
+                self.vk_view(self.texture_of(id)).image().clone(),
+            ));
         }
         if let Some(taa) = ids.taa {
             if id == taa.output {
@@ -3852,6 +4355,7 @@ impl FrameRecord<'_> {
                     let swapchain = if matches!(
                         body,
                         PassBody::Tonemap
+                            | PassBody::RayDebug
                             | PassBody::Ui
                             | PassBody::Wireframe
                             | PassBody::Outline
@@ -3897,6 +4401,43 @@ impl FrameRecord<'_> {
     /// A compute pass's body: dispatches, with no render pass around them.
     fn record_compute(&self, encoder: &mut Encoder, body: PassBody) {
         match body {
+            PassBody::RayMeshes => encoder.build_mesh_accel(),
+            PassBody::RayScene => encoder.build_scene_accel(),
+            PassBody::PathTrace => {
+                let ids = self
+                    .frame
+                    .ids
+                    .path
+                    .expect("the reference without its images");
+                let rays = self
+                    .ray_frame
+                    .as_ref()
+                    .expect("the graph scheduled the reference in a frame that traces nothing");
+                rays.pass.record_path(
+                    self.device,
+                    encoder,
+                    rays,
+                    self.table.texture(ids.sum),
+                    self.table.texture(ids.mean),
+                );
+            }
+            PassBody::GiTrace | PassBody::GiCacheShade => {
+                let rays = self
+                    .ray_frame
+                    .as_ref()
+                    .expect("the graph scheduled the volumes in a frame that traces nothing");
+                if body == PassBody::GiTrace {
+                    self.gi.record_trace(self.device, encoder, rays);
+                } else {
+                    self.gi.record_shade(self.device, encoder, rays);
+                }
+            }
+            PassBody::GiCacheCompact => self.gi.record_compact(self.device, encoder),
+            PassBody::GiUpdate => self.gi.record_update(self.device, encoder),
+            PassBody::GiGather
+            | PassBody::GiGatherTemporal
+            | PassBody::GiGatherBlur { .. }
+            | PassBody::GiGatherUpscale => self.record_gather(encoder, body),
             PassBody::SsrHiz => {
                 let ids = self
                     .frame
@@ -3915,7 +4456,7 @@ impl FrameRecord<'_> {
                 let mips = self.table.mip_textures(ids.hiz);
 
                 self.ssr
-                    .record_hiz(self.device, encoder, depth, mips, self.extent);
+                    .record_hiz(self.device, encoder, depth, mips, self.render_extent);
             }
             PassBody::SsrSource => {
                 let ids = self
@@ -3957,6 +4498,7 @@ impl FrameRecord<'_> {
                     source_pyramid,
                     source,
                     target,
+                    self.ray_frame.as_ref().filter(|_| ids.traced),
                 );
             }
             PassBody::SsrResolve => {
@@ -3993,11 +4535,24 @@ impl FrameRecord<'_> {
                     environment,
                     self.environment.sampler(),
                     target,
+                    self.ray_frame.as_ref().filter(|_| ids.traced),
+                    self.gi.views(),
                 );
             }
-            PassBody::FogScatter => {
+            PassBody::FogLight => {
+                let rays = self.ray_frame.as_ref().expect(
+                    "the graph scheduled the fog's traced light in a frame that traces nothing",
+                );
                 self.fog
-                    .record_scatter(self.device, encoder, self.shadow_atlas_view);
+                    .record_light(self.device, encoder, rays, self.gi.gather_cache());
+            }
+            PassBody::FogScatter => {
+                self.fog.record_scatter(
+                    self.device,
+                    encoder,
+                    self.shadow_atlas_view,
+                    self.gi.views(),
+                );
             }
             PassBody::FogIntegrate => {
                 let ids = self
@@ -4100,6 +4655,29 @@ impl FrameRecord<'_> {
 
                 self.taa
                     .record(self.device, encoder, &self.view, color, velocity, depth);
+            }
+            PassBody::VendorResolve => {
+                let prepass = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled the resolve with no prepass");
+                let ids = self
+                    .frame
+                    .ids
+                    .vendor_resolve
+                    .expect("a vendor resolve without its images");
+                let view = |id| self.vk_view(self.texture_of(id));
+                let images = upscaler::Images {
+                    color: view(ids.source),
+                    depth: view(prepass.depth),
+                    motion: view(prepass.velocity),
+                    exposure: view(ids.exposure_history),
+                    reactive: ids.reactive.map(view),
+                    output: view(ids.output),
+                };
+                self.upscaler
+                    .record(encoder, &images, &self.upscale, self.taa.take_reset());
             }
             PassBody::DofPrefilter => {
                 let ids = self
@@ -4255,17 +4833,26 @@ impl FrameRecord<'_> {
                 let depth = self.table.texture(prepass.depth);
 
                 self.occlusion
-                    .record(self.device, encoder, depth, self.extent);
+                    .record(self.device, encoder, depth, self.render_extent);
             }
             PassBody::LuminanceHistogram => {
-                let hdr = self.scene_color;
+                let hdr = self.metered_color;
 
                 self.exposure
-                    .record_histogram(self.device, encoder, self.extent, hdr);
+                    .record_histogram(self.device, encoder, self.output_extent, hdr);
             }
             PassBody::LuminanceAverage => {
                 self.exposure
-                    .record_average(self.device, encoder, self.extent);
+                    .record_average(self.device, encoder, self.output_extent);
+            }
+            PassBody::UpscalerExposure => {
+                self.upscaler.record_exposure(
+                    self.device,
+                    encoder,
+                    self.exposure.exposure_buffer(),
+                    self.hdr.manual_exposure,
+                    self.hdr.auto_exposure,
+                );
             }
             PassBody::BloomPrefilter => {
                 let ids = self.frame.ids.bloom.expect("bloom pass without levels");
@@ -4338,7 +4925,7 @@ impl FrameRecord<'_> {
                     self.device,
                     encoder,
                     self.opaque_draws(0),
-                    self.extent,
+                    self.render_extent,
                     self.frame_uniforms.unwrap(),
                     self.decal_block,
                     self.prepass_object_set.unwrap(),
@@ -4383,6 +4970,17 @@ impl FrameRecord<'_> {
                     self.ssao_uniforms.as_ref().unwrap(),
                 );
             }
+            PassBody::ReactiveMask => {
+                let reveal = self.frame.ids.transparency.map(|ids| ids.reveal);
+                let refraction = self.frame.ids.refraction.map(|ids| ids.accum);
+                self.upscaler.record_reactive(
+                    self.device,
+                    encoder,
+                    reveal.map(|id| self.table.texture(id)),
+                    refraction.map(|id| self.table.texture(id)),
+                    self.render_extent,
+                );
+            }
             PassBody::ContactShadows => {
                 let ids = self
                     .frame
@@ -4395,7 +4993,7 @@ impl FrameRecord<'_> {
                 self.contact_shadows.record(
                     self.device,
                     encoder,
-                    self.extent,
+                    self.render_extent,
                     self.contact_shadow_uniforms
                         .as_ref()
                         .expect("contact shadows without their uniforms"),
@@ -4414,7 +5012,7 @@ impl FrameRecord<'_> {
                     encoder,
                     self.opaque_draws(0),
                     &self.view,
-                    self.extent,
+                    self.render_extent,
                     &self.forward_sets,
                     subsurface,
                     msaa,
@@ -4430,7 +5028,7 @@ impl FrameRecord<'_> {
                     self.device,
                     encoder,
                     &self.view,
-                    self.extent,
+                    self.render_extent,
                     self.env,
                     subsurface,
                     msaa,
@@ -4448,7 +5046,7 @@ impl FrameRecord<'_> {
                     encoder,
                     self.debug_lines,
                     &self.view,
-                    self.extent,
+                    self.render_extent,
                     subsurface,
                     msaa,
                 );
@@ -4460,7 +5058,7 @@ impl FrameRecord<'_> {
                     self.transparent,
                     &self.blended_sets,
                     &self.view,
-                    self.extent,
+                    self.render_extent,
                     self.objects.transparent_base,
                     self.surfaces,
                 );
@@ -4483,10 +5081,15 @@ impl FrameRecord<'_> {
                     blur,
                     sharp,
                     &self.view,
-                    self.extent,
+                    self.render_extent,
                     self.objects.refractive_base,
                     self.surfaces,
                 );
+            }
+            PassBody::RayDebug => {
+                self.raytrace
+                    .expect("the graph scheduled a traced pass on a device that cannot trace")
+                    .record_debug(self.device, encoder, self.output_extent);
             }
             PassBody::Tonemap | PassBody::Screenshot => {
                 // With bloom off the graph has no chain, so the tonemap
@@ -4499,22 +5102,29 @@ impl FrameRecord<'_> {
                 let hdr = self.scene_color;
                 let exposure = self.exposure.exposure_buffer();
 
-                self.hdr
-                    .record_tonemap(self.device, encoder, self.extent, hdr, exposure, bloom);
+                self.hdr.record_tonemap(
+                    self.device,
+                    encoder,
+                    self.output_extent,
+                    hdr,
+                    exposure,
+                    bloom,
+                );
             }
             PassBody::ScreenshotOverlay => {
                 if let Some((pass, frame, copy)) = self.shot_overlay {
-                    pass.draw_copy(encoder, frame, copy, self.extent);
+                    pass.draw_copy(encoder, frame, copy, self.output_extent);
                 }
             }
             PassBody::Ui | PassBody::ScreenshotUi => {
                 if let Some(frame) = self.ui_frame {
-                    self.ui.record(self.device, encoder, frame, self.extent);
+                    self.ui
+                        .record(self.device, encoder, frame, self.output_extent);
                 }
             }
             PassBody::Gizmo | PassBody::ScreenshotGizmo => {
                 self.gizmo
-                    .record(self.device, encoder, self.gizmo_strokes, self.extent);
+                    .record(self.device, encoder, self.gizmo_strokes, self.output_extent);
             }
             PassBody::Wireframe | PassBody::ScreenshotWireframe => {
                 let (mode, depth) = self
@@ -4522,15 +5132,25 @@ impl FrameRecord<'_> {
                     .ids
                     .wireframe
                     .expect("a wireframe pass without its mode");
+                let hidden = match depth {
+                    None => wireframe::Hidden::No,
+                    Some(frame::EdgeDepth::Attached(_)) => wireframe::Hidden::Attached,
+                    Some(frame::EdgeDepth::Sampled(depth)) => wireframe::Hidden::Sampled(
+                        self.table.texture(depth),
+                        [0, 1].map(|axis| {
+                            self.render_extent[axis] as f32 / self.output_extent[axis] as f32
+                        }),
+                    ),
+                };
                 self.wireframe.record(
                     self.device,
                     encoder,
                     mode,
-                    depth.is_some(),
+                    hidden,
                     &[self.draws, self.transparent, self.refractive],
                     self.meshes,
                     self.view.unjittered_view_proj,
-                    self.extent,
+                    self.output_extent,
                 );
             }
             PassBody::OutlineMask => {
@@ -4539,7 +5159,7 @@ impl FrameRecord<'_> {
                     self.outline_items,
                     self.meshes,
                     self.view.unjittered_view_proj,
-                    self.extent,
+                    self.output_extent,
                 );
             }
             PassBody::Outline | PassBody::ScreenshotOutline => {
@@ -4554,7 +5174,7 @@ impl FrameRecord<'_> {
                     self.device,
                     encoder,
                     mask,
-                    self.extent,
+                    self.output_extent,
                     !self.outline_items.is_empty(),
                 );
             }
@@ -4581,6 +5201,7 @@ impl FrameRecord<'_> {
             | PassBody::SsrSource
             | PassBody::SsrTrace
             | PassBody::SsrResolve
+            | PassBody::FogLight
             | PassBody::FogScatter
             | PassBody::FogIntegrate
             | PassBody::SubsurfaceBlurHorizontal
@@ -4590,6 +5211,7 @@ impl FrameRecord<'_> {
             | PassBody::RefractionScene
             | PassBody::RefractionComposite
             | PassBody::TaaResolve
+            | PassBody::VendorResolve
             | PassBody::DofPrefilter
             | PassBody::DofTileMax
             | PassBody::DofGather
@@ -4599,12 +5221,96 @@ impl FrameRecord<'_> {
             | PassBody::MotionBlurGather
             | PassBody::LuminanceHistogram
             | PassBody::LuminanceAverage
+            | PassBody::UpscalerExposure
             | PassBody::BloomPrefilter
             | PassBody::BloomDownsample(_)
             | PassBody::BloomUpsample(_)
             | PassBody::CullReset
             | PassBody::Cull
+            | PassBody::RayMeshes
+            | PassBody::RayScene
+            | PassBody::PathTrace
+            | PassBody::GiTrace
+            | PassBody::GiCacheCompact
+            | PassBody::GiUpdate
+            | PassBody::GiCacheShade
+            | PassBody::GiGather
+            | PassBody::GiGatherTemporal
+            | PassBody::GiGatherBlur { .. }
+            | PassBody::GiGatherUpscale
             | PassBody::OcclusionHiz => unreachable!("handled above"),
+        }
+    }
+
+    /// One of the final gather's dispatches, each bound to what
+    /// `declare` said it reads and writes.
+    fn record_gather(&self, encoder: &mut Encoder, body: PassBody) {
+        let ids = self
+            .frame
+            .ids
+            .gather
+            .expect("the final gather without its images");
+        let prepass = self
+            .frame
+            .ids
+            .prepass
+            .expect("the graph scheduled the final gather with no prepass");
+        let inputs = gi_gather::Prepass {
+            depth: self.table.texture(prepass.depth),
+            normal: self.table.texture(prepass.normal),
+            velocity: self.table.texture(prepass.velocity),
+        };
+        let gather = &self.gi.gather;
+        let texture = |id| self.table.texture(id);
+        match body {
+            PassBody::GiGather => {
+                let rays = self
+                    .ray_frame
+                    .as_ref()
+                    .expect("the graph scheduled the final gather in a frame that traces nothing");
+                gather.record_gather(
+                    self.device,
+                    encoder,
+                    rays,
+                    inputs,
+                    self.gi.gather_cache(),
+                    texture(ids.raw),
+                );
+            }
+            PassBody::GiGatherTemporal => gather.record_temporal(
+                self.device,
+                encoder,
+                inputs,
+                texture(ids.raw),
+                texture(ids.history),
+                texture(ids.accumulated),
+            ),
+            PassBody::GiGatherBlur { vertical, wide } => {
+                let (source, target) = match (vertical, wide) {
+                    (false, false) => (ids.accumulated, ids.blurred_x),
+                    (true, false) => (ids.blurred_x, ids.blurred),
+                    (false, true) => (ids.blurred, ids.wide_x),
+                    (true, true) => (ids.wide_x, ids.wide),
+                };
+                gather.record_blur(
+                    self.device,
+                    encoder,
+                    inputs,
+                    texture(source),
+                    texture(ids.accumulated),
+                    texture(target),
+                    vertical,
+                    wide,
+                );
+            }
+            PassBody::GiGatherUpscale => gather.record_upscale(
+                self.device,
+                encoder,
+                inputs,
+                texture(ids.wide),
+                texture(ids.irradiance),
+            ),
+            _ => unreachable!("not one of the gather's"),
         }
     }
 

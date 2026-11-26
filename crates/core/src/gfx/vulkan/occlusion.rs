@@ -118,6 +118,7 @@ impl OcclusionPass {
             compare: false,
             anisotropy: None,
             max_lod: None,
+            lod_bias: 0.0,
         });
 
         Self {
@@ -249,7 +250,7 @@ impl Pyramid {
 /// Halved rather than copied because the base is three quarters of a pyramid's
 /// memory and the test never reads it: it picks the coarsest level that still
 /// bounds the rect. Floored at one, for the reason
-/// [`Extent::FrameDiv`](crate::gfx::graph::Extent::FrameDiv) is — halving a
+/// [`Extent::RenderDiv`](crate::gfx::graph::Extent::RenderDiv) is — halving a
 /// sliver reaches zero, and a zero-extent image is not one Vulkan will create.
 /// This must agree with what `frame::declare` imports it as.
 fn base_extent(frame: [u32; 2]) -> [u32; 2] {

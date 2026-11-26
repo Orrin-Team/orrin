@@ -30,9 +30,9 @@ use orrin_registry::Reflect;
 
 use super::{
     AmbientLight, BloomSettings, ContactShadowSettings, DecalSettings, DofSettings,
-    EnvironmentSettings, FogSettings, HdrSettings, LoadedScenes, MotionBlurSettings,
-    RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
-    TransparencySettings,
+    EnvironmentSettings, FogSettings, GiSettings, HdrSettings, LoadedScenes, MotionBlurSettings,
+    RayTracingSettings, RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings,
+    SubsurfaceSettings, TaaSettings, TransparencySettings,
 };
 
 /// Everything a scene says about how it is drawn. One component, so the
@@ -56,6 +56,10 @@ pub struct RenderSettings {
     pub motion_blur: MotionBlurSettings,
     pub dof: DofSettings,
     pub fog: FogSettings,
+    #[reflect(default)]
+    pub ray_tracing: RayTracingSettings,
+    #[reflect(default)]
+    pub gi: GiSettings,
 }
 
 /// What the resources held before a scene's settings replaced them. Present
@@ -125,6 +129,8 @@ pub fn capture(world: &World) -> RenderSettings {
         motion_blur: *world.resource(),
         dof: *world.resource(),
         fog: *world.resource(),
+        ray_tracing: *world.resource(),
+        gi: *world.resource(),
     }
 }
 
@@ -148,6 +154,8 @@ fn apply(world: &World, settings: &RenderSettings) {
         motion_blur,
         dof,
         fog,
+        ray_tracing,
+        gi,
     } = settings;
     *world.resource_mut() = *ambient;
     *world.resource_mut() = *exposure;
@@ -163,6 +171,18 @@ fn apply(world: &World, settings: &RenderSettings) {
     *world.resource_mut() = *motion_blur;
     *world.resource_mut() = *dof;
     *world.resource_mut() = *fog;
+
+    let mut live = world.resource_mut::<RayTracingSettings>();
+    *live = RayTracingSettings {
+        debug_view: live.debug_view,
+        ..*ray_tracing
+    };
+
+    let mut live = world.resource_mut::<GiSettings>();
+    *live = GiSettings {
+        debug_view: live.debug_view,
+        ..*gi
+    };
 
     let mut live = world.resource_mut::<ShadowSettings>();
     *live = ShadowSettings {

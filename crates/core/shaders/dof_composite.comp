@@ -55,7 +55,8 @@ void main() {
     vec2 uv = (vec2(texel) + 0.5) / vec2(size);
     vec3 color = texelFetch(u_color, texel, 0).rgb;
 
-    float depth = linear_depth(texelFetch(u_depth, texel, 0).r);
+    ivec2 under = texel_under(texel, size, textureSize(u_depth, 0));
+    float depth = linear_depth(texelFetch(u_depth, under, 0).r);
     float coc = dof.coc_scale * (1.0 - dof.focus_distance / max(depth, 1e-4));
 
     vec4 far = texture(u_far, uv);

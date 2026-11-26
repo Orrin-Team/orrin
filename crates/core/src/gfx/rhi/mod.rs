@@ -24,14 +24,14 @@ mod pool;
 pub use geometry::MeshSpan;
 pub(crate) use geometry::{Placement, grown};
 
-pub(crate) use pool::Pool;
+pub(crate) use pool::{Pool, has_retired};
 
 pub use desc::{
     Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, ColorAttachment,
     ComputePipelineDesc, CullMode, DepthAttachment, DepthCompare, DepthTest, Feature,
-    GeometryStream, GraphicsPipelineDesc, LoadOp, MemoryLocation, RenderTargets, SamplerDesc,
-    ShaderRef, StoreOp, TextureDesc, TextureDimension, TextureSwizzle, Topology, VertexAttribute,
-    VertexFormat, VertexStream, Viewport,
+    GeometryStream, GraphicsPipelineDesc, LoadOp, MemoryLocation, RayInstance, RenderTargets,
+    SamplerDesc, ShaderRef, StoreOp, TextureDesc, TextureDimension, TextureSwizzle, Topology,
+    VertexAttribute, VertexFormat, VertexStream, Viewport,
 };
 
 use super::format::Format;
@@ -123,6 +123,32 @@ impl Device {
         device_dispatch!(self, driver => driver.geometry_ends())
     }
 
+    /// Decide what the frame being recorded builds of the scene's acceleration
+    /// structures: the structures of meshes uploaded since, within a budget,
+    /// and the scene's own over `instances`, which the frame's two build passes
+    /// then record. An instance whose mesh has no structure yet is left out.
+    /// Returns how many the scene took.
+    ///
+    /// Only on a device that [`supports`](Self::supports)
+    /// [`Feature::RayTracing`].
+    pub fn prepare_ray_scene(&self, instances: &[RayInstance]) -> u32 {
+        match self {
+            Device::Vulkan(driver) => driver.prepare_ray_scene(instances),
+            #[cfg(target_os = "macos")]
+            Device::Metal(_) => unreachable!("Metal reports no ray tracing"),
+        }
+    }
+
+    /// Bytes of video memory the acceleration structures hold, zero on a
+    /// device that builds none.
+    pub fn ray_scene_bytes(&self) -> u64 {
+        match self {
+            Device::Vulkan(driver) => driver.ray_scene_bytes(),
+            #[cfg(target_os = "macos")]
+            Device::Metal(_) => 0,
+        }
+    }
+
     pub fn create_sampler(&self, desc: SamplerDesc) -> SamplerId {
         device_dispatch!(self, driver => driver.create_sampler(desc))
     }
@@ -175,6 +201,24 @@ impl Device {
         device_dispatch!(self, driver => {
             driver.try_create_compute_pipeline_with_samplers(desc, immutable_samplers)
         })
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// A compute pipeline that reads the material texture array at binding 0
+    /// of `texture_set`, declared partially bound where the device allows it,
+    /// as a graphics pipeline's `partial_texture_set` is.
+    pub fn create_compute_pipeline_over_textures(
+        &self,
+        desc: &ComputePipelineDesc,
+        texture_set: u32,
+    ) -> PipelineId {
+        match self {
+            Device::Vulkan(driver) => {
+                driver.try_create_compute_pipeline_over_textures(desc, texture_set)
+            }
+            #[cfg(target_os = "macos")]
+            Device::Metal(driver) => driver.try_create_compute_pipeline_with_samplers(desc, &[]),
+        }
         .unwrap_or_else(|error| panic!("{error}"))
     }
 
@@ -425,6 +469,37 @@ impl Encoder<'_> {
 
     pub fn dispatch(&mut self, groups: [u32; 3]) {
         encoder_dispatch!(self, encoder => encoder.dispatch(groups))
+    }
+
+    /// Dispatch as many groups as the first three words of `command` say,
+    /// which a pass before this one wrote on the device.
+    pub fn dispatch_indirect(&mut self, command: BufferId) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.dispatch_indirect(command),
+            // Only the irradiance volumes dispatch this way, and they trace.
+            #[cfg(target_os = "macos")]
+            Encoder::Metal(_) => unreachable!("Metal reports no ray tracing"),
+        }
+    }
+
+    /// Record the mesh acceleration structures
+    /// [`prepare_ray_scene`](Device::prepare_ray_scene) chose for this frame.
+    pub fn build_mesh_accel(&mut self) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.build_mesh_accel(),
+            #[cfg(target_os = "macos")]
+            Encoder::Metal(_) => unreachable!("Metal reports no ray tracing"),
+        }
+    }
+
+    /// Record the build of the scene's acceleration structure over the
+    /// instances [`prepare_ray_scene`](Device::prepare_ray_scene) was given.
+    pub fn build_scene_accel(&mut self) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.build_scene_accel(),
+            #[cfg(target_os = "macos")]
+            Encoder::Metal(_) => unreachable!("Metal reports no ray tracing"),
+        }
     }
 
     /// Bind the shared vertex and index buffers every mesh is a span into.

@@ -38,7 +38,25 @@ pub struct TaaSettings {
     ///
     /// Kept switchable rather than deleted so that comparison stays reproducible
     /// and the tiler path stays reachable. Structural: it recompiles the graph.
+    ///
+    /// With upscaling on, the four samples are taken at the render extent and
+    /// the temporal resolve upscales what they resolve to.
     pub msaa: bool,
+    /// How far below the output's extent the scene is rendered, for the
+    /// temporal resolve to bring back up. Anything but
+    /// [`Native`](Upscaling::Native) implies the resolve, and with it the
+    /// jitter, whatever `enabled` says: a frame rendered small and never
+    /// resolved would simply be small. Structural, like `enabled`.
+    #[reflect(default)]
+    pub upscaling: Upscaling,
+    /// What does the resolving. A request rather than a guarantee: a vendor's
+    /// upscaler runs only where its runtime does, and the engine's own resolve
+    /// stands in wherever it does not, so a scene asks for the same thing on
+    /// every machine and loads the same on each. [`UpscalerStatus`] says what
+    /// actually ran. At [`Native`](Upscaling::Native) a vendor's upscaler runs
+    /// as its antialiasing alone.
+    #[reflect(default)]
+    pub upscaler: Upscaler,
 }
 
 impl Default for TaaSettings {
@@ -48,6 +66,165 @@ impl Default for TaaSettings {
             feedback: 0.92,
             jitter_scale: 1.0,
             msaa: false,
+            upscaling: Upscaling::Native,
+            upscaler: Upscaler::BuiltIn,
         }
+    }
+}
+
+impl TaaSettings {
+    /// Whether the frame jitters and resolves: asked for, or implied by an
+    /// upscaling mode.
+    pub fn resolves(&self) -> bool {
+        self.enabled || self.upscaling != Upscaling::Native
+    }
+}
+
+/// How far below the output's extent the scene is rendered, per axis.
+///
+/// The ratios are AMD's FSR quality modes, and the render extent is rounded
+/// the way AMD rounds it, so a vendor upscaler bound in place of the engine's
+/// resolve is handed the extent it would have chosen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
+pub enum Upscaling {
+    /// Rendered at the output's extent.
+    #[default]
+    Native,
+    /// 1.5 times each way.
+    Quality,
+    /// 1.7 times each way.
+    Balanced,
+    /// 2 times each way.
+    Performance,
+    /// 3 times each way.
+    UltraPerformance,
+}
+
+impl Upscaling {
+    pub const ALL: [Upscaling; 5] = [
+        Upscaling::Native,
+        Upscaling::Quality,
+        Upscaling::Balanced,
+        Upscaling::Performance,
+        Upscaling::UltraPerformance,
+    ];
+
+    /// The output's extent over the render's, on each axis.
+    pub fn ratio(self) -> f32 {
+        match self {
+            Upscaling::Native => 1.0,
+            Upscaling::Quality => 1.5,
+            Upscaling::Balanced => 1.7,
+            Upscaling::Performance => 2.0,
+            Upscaling::UltraPerformance => 3.0,
+        }
+    }
+
+    /// The extent the scene is rendered at for an `output` this size:
+    /// divided by the ratio in single precision and truncated, as AMD's
+    /// documented quality modes compute it, and never below one.
+    pub fn render_extent(self, output: [u32; 2]) -> [u32; 2] {
+        if self == Upscaling::Native {
+            return output;
+        }
+        let ratio = self.ratio();
+        output.map(|side| ((side as f32 / ratio) as u32).max(1))
+    }
+
+    /// How many frames the jitter sequence takes before it repeats: eight
+    /// times the ratio squared, truncated as AMD's documented phase count is,
+    /// so the samples still cover each render pixel about eight times per
+    /// output pixel. Eight at native, which is the sequence the frame had
+    /// before it could upscale.
+    pub fn jitter_phases(self) -> u32 {
+        let ratio = self.ratio();
+        (8.0 * ratio * ratio) as u32
+    }
+
+    /// What every material's level of detail is offset by, so a texture
+    /// sampled at the render extent is as sharp as at the output's: AMD's
+    /// `log2(render / output) - 1`, the extra level for the samples the
+    /// resolve gathers over time. Zero at native.
+    pub fn texture_lod_bias(self) -> f32 {
+        match self {
+            Upscaling::Native => 0.0,
+            _ => -self.ratio().log2() - 1.0,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Upscaling::Native => "Native",
+            Upscaling::Quality => "Quality (1.5x)",
+            Upscaling::Balanced => "Balanced (1.7x)",
+            Upscaling::Performance => "Performance (2x)",
+            Upscaling::UltraPerformance => "Ultra performance (3x)",
+        }
+    }
+}
+
+/// Which temporal upscaler resolves the frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
+pub enum Upscaler {
+    /// The engine's own resolve, which runs everywhere.
+    #[default]
+    BuiltIn,
+    /// AMD FSR, through its signed runtime: Vulkan on Windows, in a build
+    /// with the `fsr` feature, with the DLLs found.
+    Fsr,
+    /// NVIDIA DLSS, through NGX: Vulkan on Windows, an NVIDIA RTX GPU, in a
+    /// build with the `dlss` feature, with NVIDIA's DLL found.
+    Dlss,
+}
+
+impl Upscaler {
+    pub const ALL: [Upscaler; 3] = [Upscaler::BuiltIn, Upscaler::Fsr, Upscaler::Dlss];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Upscaler::BuiltIn => "Built-in",
+            Upscaler::Fsr => "AMD FSR",
+            Upscaler::Dlss => "NVIDIA DLSS",
+        }
+    }
+}
+
+/// What the renderer resolved the last frame with, against what
+/// [`TaaSettings::upscaler`] asked for: a world resource the renderer's owner
+/// refreshes, for the editor to show.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UpscalerStatus {
+    pub asked: Upscaler,
+    /// `None` where the frame resolves nothing at all.
+    pub running: Option<Upscaler>,
+    /// Why `running` is not `asked`, where it is not.
+    pub reason: Option<std::sync::Arc<str>>,
+    /// The vendor's own name for the implementation it picked, which says
+    /// which generation of it runs on this device.
+    pub provider: Option<std::sync::Arc<str>>,
+    /// What the vendor's context holds on the device, by its own account.
+    pub memory_bytes: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The numbers a vendor upscaler will compute for itself, which this has
+    /// to agree with for the history and the jitter it is handed to be the
+    /// ones it expects: the render extent truncated, and the phase counts the
+    /// issue lists for the four modes.
+    #[test]
+    fn the_modes_agree_with_the_vendor_arithmetic() {
+        let phases = Upscaling::ALL.map(Upscaling::jitter_phases);
+        assert_eq!(phases, [8, 18, 23, 32, 72]);
+        assert_eq!(Upscaling::Native.render_extent([1921, 1081]), [1921, 1081]);
+        assert_eq!(Upscaling::Quality.render_extent([1920, 1080]), [1280, 720]);
+        assert_eq!(Upscaling::Balanced.render_extent([1920, 1080]), [1129, 635]);
+        assert_eq!(
+            Upscaling::Performance.render_extent([1921, 1081]),
+            [960, 540]
+        );
+        assert_eq!(Upscaling::UltraPerformance.render_extent([2, 2]), [1, 1]);
     }
 }

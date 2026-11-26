@@ -1,4 +1,8 @@
 #version 460
+#ifdef ORRIN_RAY_FALLBACK
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
+#endif
 
 #include "depth.glsl"
 
@@ -31,8 +35,12 @@ layout(set = 0, binding = 2) uniform sampler2D u_depth;
 layout(set = 0, binding = 3) uniform sampler2D u_normal;      // view-space, encoded
 layout(set = 0, binding = 4) uniform sampler2D u_material;    // rgb = f0, a = roughness
 layout(set = 0, binding = 5, r11f_g11f_b10f) uniform writeonly image2D u_output;
+// The traced variant shades its hits under the same cube, which
+// `ray_shade.glsl` binds for it by these names.
+#ifndef ORRIN_RAY_FALLBACK
 layout(set = 0, binding = 6) uniform textureCube u_environment;
 layout(set = 0, binding = 7) uniform sampler u_environment_sampler;
+#endif
 layout(set = 0, binding = 8) uniform Ssr {
     mat4 proj;
     mat4 inv_proj;
@@ -47,17 +55,34 @@ layout(set = 0, binding = 8) uniform Ssr {
 layout(set = 0, binding = 9) uniform sampler2D u_hiz;
 layout(set = 0, binding = 10) uniform sampler2D u_source;
 
+#ifdef ORRIN_RAY_FALLBACK
+#include "ray_shade.glsl"
+#else
+// The irradiance volumes, which the traced variant has at set 4 through
+// `ray_shade.glsl`; here in a set of their own.
+#define ORRIN_GI_SET 1
+#define ORRIN_GI_BLOCK_BINDING 0
+#define ORRIN_GI_PROBES_BINDING 1
+#define ORRIN_GI_IRRADIANCE_BINDING 2
+#define ORRIN_GI_DISTANCE_BINDING 3
+#define ORRIN_GI_SAMPLER_BINDING 4
+#include "gi.glsl"
+#endif
 #include "ssr_march.glsl"
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 // World space into the environment's own frame — the same rotation the skybox
 // and the forward pass sample through, so the sky and what mirrors it agree.
+// The traced variant has `ambient.glsl`'s, which is the same rotation read out
+// of the lighting block.
+#ifndef ORRIN_RAY_FALLBACK
 vec3 to_environment(vec3 v) {
     float s = ssr.env.x;
     float c = ssr.env.y;
     return vec3(c * v.x - s * v.z, v.y, s * v.x + c * v.z);
 }
+#endif
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -206,8 +231,20 @@ void main() {
     vec3 world_v = normalize(mat3(ssr.inv_view) * v);
     vec3 r = to_environment(reflect(-world_v, world_n));
     float lod = roughness * (ssr.env.z - 1.0);
-    vec3 environment =
-        textureLod(samplerCube(u_environment, u_environment_sampler), r, lod).rgb * ssr.env_tint.rgb;
+    // Scaled as the forward pass scaled it, by how much of the sky's light the
+    // volumes say reaches this point, or this would take back more than it put
+    // in. See `gi_reflection_scale`. Through the tint, for the reason the
+    // forward pass goes through the energy term: off, the product is the one
+    // it always was.
+    float reflection = 1.0;
+    if (gi_live() && gi.camera.w > 0.5) {
+        vec3 world_p = (ssr.inv_view * vec4(p, 1.0)).xyz;
+        vec3 sky = gi_sky_irradiance(world_n);
+        vec4 local = gi_irradiance(world_p, world_n, world_v);
+        reflection = gi_reflection_scale(local.rgb + sky * (1.0 - local.a), sky);
+    }
+    vec3 environment = textureLod(samplerCube(u_environment, u_environment_sampler), r, lod).rgb
+                     * (ssr.env_tint.rgb * reflection);
 
     vec2 dfg = env_brdf_approx(roughness, n_dot_v);
     vec3 weight = (f0 * dfg.x + dfg.y) * energy_compensation(f0, roughness, n_dot_v);

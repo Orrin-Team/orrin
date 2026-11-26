@@ -144,6 +144,7 @@ impl RefractionPass {
                 compare: false,
                 anisotropy: None,
                 max_lod: None,
+                lod_bias: 0.0,
             }),
             pyramid_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
                 shader: ShaderId::ColorPyramidComp.into(),
@@ -158,6 +159,7 @@ impl RefractionPass {
                 compare: false,
                 anisotropy: None,
                 max_lod: Some(1.0),
+                lod_bias: 0.0,
             }),
             composite_sampler: device.create_sampler(SamplerDesc {
                 linear: false,
@@ -166,6 +168,7 @@ impl RefractionPass {
                 compare: false,
                 anisotropy: None,
                 max_lod: Some(0.0),
+                lod_bias: 0.0,
             }),
         }
     }

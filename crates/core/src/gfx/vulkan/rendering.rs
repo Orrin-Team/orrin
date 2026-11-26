@@ -201,6 +201,13 @@ pub(super) fn rendering_info(
             let ssao = ids.ssao.expect("SSAO pass without SSAO resources");
             color_only(overwritten(images.texture(ssao.ao)))
         }
+        PassBody::ReactiveMask => color_only(overwritten(
+            images.texture(
+                ids.vendor_resolve
+                    .and_then(|vendor| vendor.reactive)
+                    .expect("a reactive mask pass without its mask"),
+            ),
+        )),
         PassBody::ContactShadows => color_only(overwritten(
             images.texture(
                 ids.contact_shadows
@@ -311,7 +318,7 @@ pub(super) fn rendering_info(
             ))),
         },
         // The acquired swapchain image, every pixel of which the tonemap writes.
-        PassBody::Tonemap => color_only(overwritten(swapchain)),
+        PassBody::Tonemap | PassBody::RayDebug => color_only(overwritten(swapchain)),
         // Cleared to "nothing outlined".
         PassBody::OutlineMask => color_only(cleared(
             images.texture(
@@ -337,7 +344,12 @@ pub(super) fn rendering_info(
             };
             RenderTargets {
                 colors: vec![color],
-                depth: depth.map(|depth| depth_borrowed(images.texture(depth))),
+                depth: match depth {
+                    Some(super::frame::EdgeDepth::Attached(depth)) => {
+                        Some(depth_borrowed(images.texture(depth)))
+                    }
+                    Some(super::frame::EdgeDepth::Sampled(_)) | None => None,
+                },
             }
         }
         // Cleared to nothing drawn, which the resolve reads as no coverage, and
@@ -377,6 +389,7 @@ pub(super) fn rendering_info(
         | PassBody::SsrSource
         | PassBody::SsrTrace
         | PassBody::SsrResolve
+        | PassBody::FogLight
         | PassBody::FogScatter
         | PassBody::FogIntegrate
         | PassBody::SubsurfaceBlurHorizontal
@@ -386,6 +399,7 @@ pub(super) fn rendering_info(
         | PassBody::RefractionScene
         | PassBody::RefractionComposite
         | PassBody::TaaResolve
+        | PassBody::VendorResolve
         | PassBody::DofPrefilter
         | PassBody::DofTileMax
         | PassBody::DofGather
@@ -395,11 +409,23 @@ pub(super) fn rendering_info(
         | PassBody::MotionBlurGather
         | PassBody::LuminanceHistogram
         | PassBody::LuminanceAverage
+        | PassBody::UpscalerExposure
         | PassBody::BloomPrefilter
         | PassBody::BloomDownsample(_)
         | PassBody::BloomUpsample(_)
         | PassBody::CullReset
-        | PassBody::Cull => return None,
+        | PassBody::Cull
+        | PassBody::RayMeshes
+        | PassBody::RayScene
+        | PassBody::PathTrace
+        | PassBody::GiTrace
+        | PassBody::GiCacheCompact
+        | PassBody::GiUpdate
+        | PassBody::GiCacheShade
+        | PassBody::GiGather
+        | PassBody::GiGatherTemporal
+        | PassBody::GiGatherBlur { .. }
+        | PassBody::GiGatherUpscale => return None,
     })
 }
 

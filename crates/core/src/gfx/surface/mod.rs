@@ -107,6 +107,17 @@
 //! position, normal or eye direction to build a `SurfaceIn` from, and its view is
 //! the light's, so a `SurfaceIn` it could build would describe another surface.
 //!
+//! Nor does a ray's hit (`shaders/ray_shade.glsl`): a custom surface found by a
+//! traced ray — in a mirror, where the screen had no answer — is its material's
+//! standard reading, its maps and factors without what the function did to
+//! them. A rasterised draw is one material's, so one function; a traced
+//! dispatch lands on every material in the scene at once. Running the function
+//! there means a variant of every traced shader per surface shader and a
+//! dispatch per shader over the hits that landed on it, which is id Tech 8's
+//! shape with its handful of shader types and needs hits sorted into indirect
+//! dispatches the RHI does not have. Until it does, what a traced ray sees of
+//! a custom surface is what the material would be without one.
+//!
 //! **The artifact** ([`SurfaceArtifact`]) is what an exported game loads: the
 //! parameter table, every variant's SPIR-V and MSL with its binding map, and the
 //! [`SOURCES_HASH`](super::shaders::SOURCES_HASH) it was compiled against. Its

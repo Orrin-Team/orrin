@@ -502,6 +502,42 @@ fn an_attachment_declared_by_a_compute_pass_is_rejected_by_name() {
     );
 }
 
+/// An acceleration structure is not a buffer a shader stores to, and a barrier
+/// derived from calling it one would name the compute stage where the build
+/// stage does the writing: nothing would be ordered against the build at all.
+#[test]
+fn an_acceleration_structure_takes_only_its_own_accesses_and_nothing_else_takes_them() {
+    let mut builder = GraphBuilder::new();
+    let scene = builder.import_acceleration_structure("scene");
+    builder
+        .pass("build", PassKind::Compute)
+        .access(scene, Access::StorageWrite)
+        .build();
+    assert_eq!(
+        compile(builder).unwrap_err(),
+        GraphError::NotAnAccelerationStructureAccess {
+            pass: "build",
+            resource: "scene",
+            access: Access::StorageWrite,
+        }
+    );
+
+    let mut builder = GraphBuilder::new();
+    let rows = builder.import_buffer("rows");
+    builder
+        .pass("trace", PassKind::Compute)
+        .access(rows, Access::AccelerationStructureRead)
+        .build();
+    assert_eq!(
+        compile(builder).unwrap_err(),
+        GraphError::NotAnAccelerationStructureAccess {
+            pass: "trace",
+            resource: "rows",
+            access: Access::AccelerationStructureRead,
+        }
+    );
+}
+
 /// A compute pass is scheduled and synchronised exactly like an inline one — the
 /// kind changes how the executor brackets it, not where it lands or what has to
 /// finish first. Worth pinning, because the alternative reading (compute is a

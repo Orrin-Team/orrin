@@ -62,6 +62,23 @@ const INITIAL_INDICES: u64 = 1 << 15;
 /// fetches its own vertices so each corner knows which corner it is.
 const POSITION_USAGE: BufferUsage = BufferUsage::VERTEX_BUFFER.union(BufferUsage::STORAGE_BUFFER);
 const INDEX_USAGE: BufferUsage = BufferUsage::INDEX_BUFFER.union(BufferUsage::STORAGE_BUFFER);
+/// And the surfaces, for a ray's hit: it has no vertex shader to hand it a
+/// normal, so it reads the three corners' and blends them itself.
+const SURFACE_USAGE: BufferUsage = BufferUsage::VERTEX_BUFFER.union(BufferUsage::STORAGE_BUFFER);
+
+/// What a buffer an acceleration structure is built from carries besides: the
+/// build names its inputs by address. Only on a device that traces, because
+/// neither usage exists on one that does not.
+const BUILD_INPUT_USAGE: BufferUsage = BufferUsage::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY
+    .union(BufferUsage::SHADER_DEVICE_ADDRESS);
+
+fn traced(ctx: &VkContext, usage: BufferUsage) -> BufferUsage {
+    if ctx.ray_tracing {
+        usage | BUILD_INPUT_USAGE
+    } else {
+        usage
+    }
+}
 
 /// The shared geometry every opaque and blended pass binds.
 pub(crate) struct MeshArena {
@@ -82,14 +99,14 @@ impl MeshArena {
     pub(super) fn new(ctx: &VkContext, frames_in_flight: u64) -> Self {
         let host_visible = ctx.profile.wide_bar();
         Self {
-            positions: allocate(ctx, POSITION_USAGE, INITIAL_VERTICES, host_visible),
-            surfaces: allocate(
+            positions: allocate(
                 ctx,
-                BufferUsage::VERTEX_BUFFER,
+                traced(ctx, POSITION_USAGE),
                 INITIAL_VERTICES,
                 host_visible,
             ),
-            indices: allocate(ctx, INDEX_USAGE, INITIAL_INDICES, host_visible),
+            surfaces: allocate(ctx, SURFACE_USAGE, INITIAL_VERTICES, host_visible),
+            indices: allocate(ctx, traced(ctx, INDEX_USAGE), INITIAL_INDICES, host_visible),
             placement: Placement::new(frames_in_flight),
             host_visible,
             pending: Vec::new(),
@@ -121,7 +138,28 @@ impl MeshArena {
         match stream {
             crate::gfx::rhi::GeometryStream::Positions => self.positions.clone().into_bytes(),
             crate::gfx::rhi::GeometryStream::Indices => self.indices.clone().into_bytes(),
+            crate::gfx::rhi::GeometryStream::Surfaces => self.surfaces.clone().into_bytes(),
         }
+    }
+
+    /// A mesh's positions and indices as an acceleration structure build
+    /// reads them: each from the mesh's own first element, so the build's
+    /// indices need no offset.
+    pub(super) fn build_inputs(
+        &self,
+        span: MeshSpan,
+        vertices: u32,
+    ) -> (Subbuffer<[PositionVertex]>, Subbuffer<[u32]>) {
+        let first_vertex = span.vertex_offset as u64;
+        let first_index = u64::from(span.first_index);
+        (
+            self.positions
+                .clone()
+                .slice(first_vertex..first_vertex + u64::from(vertices)),
+            self.indices
+                .clone()
+                .slice(first_index..first_index + u64::from(span.index_count)),
+        )
     }
 
     /// Put a mesh into the arena and say where it landed.
@@ -219,7 +257,7 @@ impl MeshArena {
                 ctx,
                 &mut builder,
                 &self.positions,
-                POSITION_USAGE,
+                traced(ctx, POSITION_USAGE),
                 capacity,
                 held_vertices,
                 self.host_visible,
@@ -230,7 +268,7 @@ impl MeshArena {
                 ctx,
                 &mut builder,
                 &self.surfaces,
-                BufferUsage::VERTEX_BUFFER,
+                SURFACE_USAGE,
                 capacity,
                 held_vertices,
                 self.host_visible,
@@ -241,7 +279,7 @@ impl MeshArena {
                 ctx,
                 &mut builder,
                 &self.indices,
-                INDEX_USAGE,
+                traced(ctx, INDEX_USAGE),
                 capacity,
                 held_indices,
                 self.host_visible,
@@ -253,7 +291,7 @@ impl MeshArena {
     /// Submit an arena copy without waiting for it, ending it with the barrier
     /// that orders it before anything later on the queue reads the arena.
     fn submit(&mut self, ctx: &VkContext, mut builder: Recorder) {
-        builder.transfer_to_geometry_reads();
+        builder.transfer_to_geometry_reads(ctx.ray_tracing);
         let (commands, keep) = builder.end();
         self.pending.retain(|copy| !copy.is_complete());
         self.pending.push(record::submit_frame(

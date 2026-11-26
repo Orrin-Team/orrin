@@ -4,7 +4,18 @@
 use glam::Vec3;
 use orrin_core::capture::{CaptureSettings, Floor};
 use orrin_core::scene::entities::SceneChoice;
-use orrin_core::scene::{Camera, FogSettings, ShadowDebugView};
+use orrin_core::scene::{
+    Camera, FogSettings, GiDebugView, GiGatherResolution, RayDebugView, ShadowDebugView, Upscaling,
+};
+
+/// The warm-up of every capture the irradiance volumes light, of the half of
+/// each pair they do not, and of the path-traced reference they are held
+/// against. A probe averages its first fifteen updates before it keeps a fixed
+/// share of its history, a grid is updated one frame in six, and a cell's
+/// light reaches the probes an update after it is first used; and the
+/// exposure takes longer than any of that to come down to a room lit by one
+/// lamp, so a pair taken at two warm-ups is a pair at two exposures.
+const GI_FRAMES: u32 = 768;
 
 /// Where both fog captures stand, shared so the pair differs in one field.
 ///
@@ -69,9 +80,77 @@ fn sun_penumbra() -> CaptureSettings {
     }
 }
 
+/// The upscaling set's shared settings, so the five differ in the mode alone:
+/// close on the leaf cards, whose cut-out edges are the thinnest in the rig,
+/// the decals at their feet, and the rows of checkered cubes behind them, whose
+/// texture is finer than a pixel at the back of the grid. 1080p, and long
+/// enough for the three-times mode's accumulation to fill: an output pixel
+/// there is sampled closely about one frame in nine.
+fn upscaled(upscaling: Upscaling) -> CaptureSettings {
+    CaptureSettings {
+        extent: [1920, 1080],
+        frames: 192,
+        upscaling,
+        camera: Some(Camera {
+            position: Vec3::new(-16.5, 3.2, 15.5),
+            target: Vec3::new(-10.5, 0.4, 5.5),
+            ..Camera::default()
+        }),
+        ..CaptureSettings::default()
+    }
+}
+
+/// Into the rooms scene's closed room, toward the thin wall, and into the
+/// room lit by its panel, from a corner; and down onto the red block on its
+/// white sheet in the courtyard, from the sunlit side.
+const LEAK: ([f32; 3], [f32; 3]) = ([5.2, 1.5, 2.2], [0.0, 1.3, -0.6]);
+const EMISSIVE: ([f32; 3], [f32; 3]) = ([14.6, 1.6, 2.4], [9.5, 1.0, -1.5]);
+const BLOCK: ([f32; 3], [f32; 3]) = ([-2.6, 1.2, 1.5], [-0.85, 0.1, 0.0]);
+
+/// Thick enough air indoors that what it scatters is most of the picture.
+fn room_fog() -> FogSettings {
+    FogSettings {
+        density: 0.15,
+        height_falloff: 0.0,
+        volumetric: true,
+        // The froxels' depth spent on the room rather than on the hundred
+        // metres outside it.
+        distance: 16.0,
+        ..FogSettings::default()
+    }
+}
+
+/// A rooms capture from `view`, the volumes on or off, with the sun's
+/// shadows: the courtyard's light has to stop at the thin wall for the leak
+/// to mean anything.
+fn rooms((position, target): ([f32; 3], [f32; 3]), gi: bool) -> CaptureSettings {
+    CaptureSettings {
+        scene: SceneChoice::Rooms,
+        shadows: true,
+        punctual_shadows: true,
+        gi,
+        frames: GI_FRAMES,
+        camera: Some(Camera {
+            position: Vec3::from(position),
+            target: Vec3::from(target),
+            ..Camera::default()
+        }),
+        ..CaptureSettings::default()
+    }
+}
+
+/// A rooms capture lit by the volumes and the final gather over them.
+fn gathered(view: ([f32; 3], [f32; 3])) -> CaptureSettings {
+    CaptureSettings {
+        gi_gather: Some(GiGatherResolution::Half),
+        ..rooms(view, true)
+    }
+}
+
 /// Every capture, by the name its file carries.
 pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
-    vec![
+    #[cfg_attr(not(any(feature = "fsr", feature = "dlss")), allow(unused_mut))]
+    let mut captures = vec![
         ("scene", CaptureSettings::default()),
         // The editor's two wireframe draw modes over the same frame: edges
         // hidden by the scene's depth, and every edge alone. Against
@@ -267,6 +346,190 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                 ..CaptureSettings::default()
             },
         ),
+        // The traced scene in place of the frame, from the rig's own camera so
+        // each reads against `scene.png`: what stands in the acceleration
+        // structures and where, as one colour per instance, as the distance a
+        // ray travels, and as each hit triangle's own normal. A mesh missing
+        // from the first is one that was never built or never instanced; a
+        // normal that disagrees with the shaded frame is a hit resolved to the
+        // wrong triangle.
+        (
+            "ray-debug-instance",
+            CaptureSettings {
+                ray_debug: RayDebugView::Instance,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "ray-debug-distance",
+            CaptureSettings {
+                ray_debug: RayDebugView::HitDistance,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "ray-debug-normal",
+            CaptureSettings {
+                ray_debug: RayDebugView::GeometricNormal,
+                ..CaptureSettings::default()
+            },
+        ),
+        // The reference: the rig path traced from its own camera, every bounce
+        // followed, summed over this many frames. What `scene.png` is held
+        // against once light bounces in the frame too; until then the
+        // difference between the two is the bounce light the frame does not
+        // have, beside everything a traced ray does not see — nothing blended
+        // or refractive, no air, a material's standard reading. Its noise is
+        // what is left of one path per pixel per frame after this many.
+        (
+            "path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                frames: 768,
+                ..CaptureSettings::default()
+            },
+        ),
+        // The irradiance volumes off and on over the rig, from its own camera
+        // and with the same long warm-up, so the pair differs in the volumes
+        // alone: the ground and the cubes' undersides lit by what bounced
+        // off each other rather than by the whole sky, and the floor's
+        // colour on the cubes. The third is the volumes alone, on white.
+        (
+            "gi-rig-off",
+            CaptureSettings {
+                frames: GI_FRAMES,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "gi-rig",
+            CaptureSettings {
+                gi: true,
+                frames: GI_FRAMES,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "gi-rig-irradiance",
+            CaptureSettings {
+                gi: true,
+                gi_debug: GiDebugView::Irradiance,
+                frames: GI_FRAMES,
+                ..CaptureSettings::default()
+            },
+        ),
+        // The closed room behind the ten-centimetre wall, lit by one small
+        // lamp, with the sunlit courtyard on the wall's other side. Off, the
+        // sky's diffuse light fills the room as if it had no roof; on, what
+        // is left is the lamp and its bounce — and any light on the near face
+        // of the thin wall that the courtyard puts there is the leak the
+        // probes' visibility exists to stop. The reference is the room as it
+        // is, every bounce followed, at the exposure of the frame lit by the
+        // volumes.
+        ("gi-leak-off", rooms(LEAK, false)),
+        ("gi-leak", rooms(LEAK, true)),
+        (
+            "gi-leak-path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                ..rooms(LEAK, true)
+            },
+        ),
+        // The final gather over the volumes, in the room the lamp lights, and
+        // the reference at the exposure of that frame: a frame the gather
+        // lights is metered apart from one the volumes light.
+        ("gi-leak-gather", gathered(LEAK)),
+        (
+            "gi-leak-gather-path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                ..gathered(LEAK)
+            },
+        ),
+        // The red block on its white sheet, in the sky's light: off, the
+        // volumes, the volumes with the final gather over them, and the
+        // reference. The probes are a metre apart, so the second shows the
+        // sheet lit as if the block were not there; the gather and the
+        // reference darken the sheet round the block's foot and tint it red
+        // beside the block's faces. The fifth is the gather at a quarter of
+        // the frame each way, against the third.
+        ("gi-block-off", rooms(BLOCK, false)),
+        ("gi-block", rooms(BLOCK, true)),
+        ("gi-block-gather", gathered(BLOCK)),
+        (
+            "gi-block-gather-quarter",
+            CaptureSettings {
+                gi_gather: Some(GiGatherResolution::Quarter),
+                ..rooms(BLOCK, true)
+            },
+        ),
+        (
+            "gi-block-path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                ..rooms(BLOCK, true)
+            },
+        ),
+        (
+            "gi-block-gather-path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                ..gathered(BLOCK)
+            },
+        ),
+        // The room with no light but its glowing ceiling panel, between a red
+        // wall and a green one. Off, the sky lights it through its roof; on,
+        // the panel does, and the walls bleed their colour onto the floor.
+        ("gi-emissive-off", rooms(EMISSIVE, false)),
+        ("gi-emissive", rooms(EMISSIVE, true)),
+        // The final gather over the volumes. Light leaves the panel only by
+        // what bounced, and a ray from the floor that meets the panel reads
+        // what it emits, where the probes a metre apart average it over the
+        // room.
+        ("gi-emissive-gather", gathered(EMISSIVE)),
+        // The screen-space occlusion off under the volumes, for the corners:
+        // the probes are a metre apart and see none of a corner's last half
+        // metre, which is the occlusion's to darken, so the pair should
+        // differ there and not across the walls.
+        (
+            "gi-emissive-no-ssao",
+            CaptureSettings {
+                ssao: false,
+                ..rooms(EMISSIVE, true)
+            },
+        ),
+        // The same room filled with marched air. Off, the air scatters the
+        // scene's flat ambient whatever is round it; on, it scatters what the
+        // volumes hold — bright under the panel, dim in the corners, and
+        // tinted by the wall it is near.
+        (
+            "gi-emissive-fog-off",
+            CaptureSettings {
+                fog: Some(room_fog()),
+                ..rooms(EMISSIVE, false)
+            },
+        ),
+        (
+            "gi-emissive-fog",
+            CaptureSettings {
+                fog: Some(room_fog()),
+                ..rooms(EMISSIVE, true)
+            },
+        ),
+        (
+            "gi-emissive-path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                ..rooms(EMISSIVE, true)
+            },
+        ),
+        (
+            "gi-emissive-gather-path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                ..gathered(EMISSIVE)
+            },
+        ),
         (
             "shadow-debug-cache",
             CaptureSettings {
@@ -402,6 +665,42 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
             "ssr-sphere-row",
             reflection_view(None, Vec3::new(2.0, 1.6, 6.0), Vec3::new(0.0, 1.5, 14.0)),
         ),
+        // Three of the mirrors again with nothing traced, so each pair differs
+        // in exactly what the traced ray adds: the part of a reflection whose
+        // ray left the frame or passed behind what is in it. Low across the
+        // floor, the reflected cubes run off the frame's edge; steep over the
+        // grid, each cube's reflection ends where the screen stops holding the
+        // cube; above the spheres, the mirror wants their undersides, which no
+        // pixel shows. A device that cannot trace draws both halves alike.
+        (
+            "ssr-mirror-screen",
+            CaptureSettings {
+                ray_tracing: false,
+                ..reflective_floor(Floor::Mirror)
+            },
+        ),
+        (
+            "ssr-steep-screen",
+            CaptureSettings {
+                ray_tracing: false,
+                ..reflection_view(
+                    Some(Floor::Mirror),
+                    Vec3::new(6.0, 5.5, 10.0),
+                    Vec3::new(2.0, 0.0, 3.0),
+                )
+            },
+        ),
+        (
+            "ssr-spheres-above-screen",
+            CaptureSettings {
+                ray_tracing: false,
+                ..reflection_view(
+                    Some(Floor::Mirror),
+                    Vec3::new(1.5, 9.0, 18.0),
+                    Vec3::new(0.0, 0.0, 12.5),
+                )
+            },
+        ),
         // The sweep's spheres as rough metal, from below and beside the row:
         // the lower half of each reflects the ground and the glowing cubes,
         // which few of its rays reach.
@@ -425,6 +724,19 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                 motion_blur: true,
                 ..CaptureSettings::default()
             },
+        ),
+        // The scene rendered below the output and the temporal resolve bringing
+        // it up, at each mode and at native, from one camera at one extent: what
+        // each pair differs in is the upscaling alone. Look at the leaf cards'
+        // edges for stair-steps, the far cubes' checker for moire, and the
+        // decals for softness against `upscale-native`.
+        ("upscale-native", upscaled(Upscaling::Native)),
+        ("upscale-quality", upscaled(Upscaling::Quality)),
+        ("upscale-balanced", upscaled(Upscaling::Balanced)),
+        ("upscale-performance", upscaled(Upscaling::Performance)),
+        (
+            "upscale-ultra-performance",
+            upscaled(Upscaling::UltraPerformance),
         ),
         // Four samples instead of the temporal resolve: the other forward render
         // pass shape, with a resolve attachment and a depth that is scratch
@@ -481,5 +793,56 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                 ..CaptureSettings::default()
             },
         ),
-    ]
+    ];
+    // The upscaling set again through AMD FSR, each named to pair with the
+    // engine's own in ICAT, its native-AA mode against `upscale-native`, and
+    // FSR's debug view over the quality mode: the motion it was handed top
+    // left, and where it judged its history stale top right. Skipped where
+    // FSR does not run.
+    #[cfg(feature = "fsr")]
+    {
+        use orrin_core::scene::Upscaler;
+        let fsr = |upscaling| CaptureSettings {
+            upscaler: Upscaler::Fsr,
+            ..upscaled(upscaling)
+        };
+        captures.extend([
+            ("upscale-fsr-native", fsr(Upscaling::Native)),
+            ("upscale-fsr-quality", fsr(Upscaling::Quality)),
+            ("upscale-fsr-balanced", fsr(Upscaling::Balanced)),
+            ("upscale-fsr-performance", fsr(Upscaling::Performance)),
+            (
+                "upscale-fsr-ultra-performance",
+                fsr(Upscaling::UltraPerformance),
+            ),
+            (
+                "upscale-fsr-debug-view",
+                CaptureSettings {
+                    upscaler_debug_view: true,
+                    ..fsr(Upscaling::Quality)
+                },
+            ),
+        ]);
+    }
+    // And through NVIDIA DLSS, its native mode being DLAA. Skipped where DLSS
+    // does not run, which is anywhere without an RTX GPU.
+    #[cfg(feature = "dlss")]
+    {
+        use orrin_core::scene::Upscaler;
+        let dlss = |upscaling| CaptureSettings {
+            upscaler: Upscaler::Dlss,
+            ..upscaled(upscaling)
+        };
+        captures.extend([
+            ("upscale-dlss-native", dlss(Upscaling::Native)),
+            ("upscale-dlss-quality", dlss(Upscaling::Quality)),
+            ("upscale-dlss-balanced", dlss(Upscaling::Balanced)),
+            ("upscale-dlss-performance", dlss(Upscaling::Performance)),
+            (
+                "upscale-dlss-ultra-performance",
+                dlss(Upscaling::UltraPerformance),
+            ),
+        ]);
+    }
+    captures
 }

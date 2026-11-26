@@ -369,6 +369,14 @@ pub fn from_constant(radiance: Vec3) -> [Vec3; SH9] {
     convolve(coefficients)
 }
 
+/// The radiance a set of irradiance coefficients describes: each band's
+/// cosine lobe divided back out, the ringing window and the sun clamp left
+/// in. What a probe ray that leaves the scene reads, so a probe that sees only
+/// sky sums back to the irradiance these coefficients give a surface.
+pub fn radiance(irradiance: &[Vec3; SH9]) -> [Vec3; SH9] {
+    std::array::from_fn(|i| irradiance[i] / COSINE_LOBE[BAND[i]])
+}
+
 /// Irradiance divided by pi in `direction` — what the shader computes, here so
 /// tests can assert against it without a GPU, and so the material preview can
 /// meter the sky it lights its sphere with.

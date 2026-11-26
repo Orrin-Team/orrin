@@ -77,6 +77,30 @@ pub struct CaptureSettings {
     pub punctual_shadows: bool,
     /// Which of the shadows' debug views the frame is drawn through.
     pub shadow_debug: ShadowDebugView,
+    /// Which view of the traced scene is drawn in place of the frame. On a
+    /// device that cannot trace, the capture is the frame as it was.
+    pub ray_debug: crate::scene::RayDebugView,
+    /// Whether anything traces a ray. On by default, as it is in the engine;
+    /// off is the other half of the A/B for whatever a traced ray adds — a
+    /// reflection of what the screen does not hold — and is the frame every
+    /// device that cannot trace draws.
+    pub ray_tracing: bool,
+    /// Whether the irradiance volumes light the frame. Off by default, so
+    /// every capture taken before they existed is the frame it was; on is the
+    /// other half of the A/B for everything they change. Needs `ray_tracing`,
+    /// and a device that traces.
+    pub gi: bool,
+    /// Whether the final gather lights the opaque surfaces, and at which
+    /// resolution. Off by default, so a capture of the volumes is of the
+    /// volumes alone; on is the other half of the A/B for what the gather
+    /// adds below the probes' spacing. Needs `gi`.
+    pub gi_gather: Option<crate::scene::GiGatherResolution>,
+    /// Which of the volumes' debug views the frame is drawn through.
+    pub gi_debug: crate::scene::GiDebugView,
+    /// Screen-space ambient occlusion. On, as it ships; off is the other half
+    /// of the A/B that says whether it and the volumes darken one corner
+    /// twice.
+    pub ssao: bool,
     /// The sun's angular diameter in degrees, or `None` for the default. Zero
     /// is the other half of an A/B: every edge at one width, whatever cast it.
     pub sun_angle: Option<f32>,
@@ -91,6 +115,16 @@ pub struct CaptureSettings {
     /// Rasterise the forward pass at four samples. The alternative to `taa`, which
     /// the capture turns off when this is on: the two are not companions.
     pub msaa: bool,
+    /// How far below `extent` the scene is rendered, for the temporal resolve
+    /// to bring back up. `extent` is the output's whatever this is, so a set
+    /// taken at every mode pairs pixel for pixel.
+    pub upscaling: crate::scene::Upscaling,
+    /// What resolves the frame. Where the one asked for cannot run, the
+    /// engine's resolve does, and [`render`]'s renderer says so through
+    /// `upscaler_status`.
+    pub upscaler: crate::scene::Upscaler,
+    /// Whether a vendor's upscaler draws its debug view over the frame.
+    pub upscaler_debug_view: bool,
     /// The air, or `None` for whatever the scene asked for.
     ///
     /// Overridden whole rather than by a flag, because the A/B the fog captures
@@ -161,11 +195,20 @@ impl Default for CaptureSettings {
             shadows: false,
             punctual_shadows: false,
             shadow_debug: ShadowDebugView::None,
+            ray_debug: crate::scene::RayDebugView::None,
+            ray_tracing: true,
+            gi: false,
+            gi_gather: None,
+            gi_debug: crate::scene::GiDebugView::None,
+            ssao: true,
             sun_angle: None,
             ssr: false,
             dof: false,
             motion_blur: false,
             msaa: false,
+            upscaling: crate::scene::Upscaling::Native,
+            upscaler: crate::scene::Upscaler::BuiltIn,
+            upscaler_debug_view: false,
             fog: None,
             scene: SceneChoice::default(),
             camera: None,
@@ -200,12 +243,24 @@ pub fn scene_pixels_metal(settings: &CaptureSettings) -> (Vec<u8>, [u32; 2]) {
 ///
 /// Panics rather than returning an error on a device that cannot be reached: it
 /// is a developer tool driven from a test, and a `Result` nobody can act on
-/// would only push the same panic one frame up the stack.
-pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
+/// would only push the same panic one frame up the stack. The one `Err` is a
+/// capture of an upscaler this machine cannot run, which writes nothing and
+/// says why: its frame would be the engine's resolve under the vendor's name.
+pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) -> Result<(), String> {
     let mut renderer = offscreen_renderer(settings.extent);
     let mut world = World::new();
     prepare(&mut world, &mut renderer, settings);
     let (pixels, extent) = render(&mut world, &mut renderer, settings);
+    let status = renderer.upscaler_status();
+    if settings.upscaler != crate::scene::Upscaler::BuiltIn
+        && status.running != Some(settings.upscaler)
+    {
+        return Err(status
+            .reason
+            .as_deref()
+            .unwrap_or("it did not run")
+            .to_string());
+    }
     image::save_buffer(
         path.as_ref(),
         &pixels,
@@ -214,6 +269,7 @@ pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
         image::ColorType::Rgba8,
     )
     .expect("failed to write the capture");
+    Ok(())
 }
 
 /// A renderer drawing into an image of `extent` rather than a window.
@@ -253,7 +309,10 @@ pub fn prepare(world: &mut World, renderer: &mut VulkanRenderer, settings: &Capt
         world.insert_resource(camera);
     }
 
-    world.insert_resource(SsaoSettings::default());
+    world.insert_resource(SsaoSettings {
+        enabled: settings.ssao,
+        ..SsaoSettings::default()
+    });
     world.insert_resource(ContactShadowSettings::default());
     world.insert_resource(SsrSettings {
         enabled: settings.ssr,
@@ -275,6 +334,8 @@ pub fn prepare(world: &mut World, renderer: &mut VulkanRenderer, settings: &Capt
     world.insert_resource(TaaSettings {
         enabled: settings.taa && !settings.msaa,
         msaa: settings.msaa,
+        upscaling: settings.upscaling,
+        upscaler: settings.upscaler,
         ..TaaSettings::default()
     });
     if let Some(fog) = settings.fog {
@@ -357,6 +418,19 @@ pub fn render(
         });
 
     renderer.pin_surface_time(settings.surface_time);
+    renderer.set_upscaler_debug_view(settings.upscaler_debug_view);
+    renderer.set_ray_tracing(crate::scene::RayTracingSettings {
+        enabled: settings.ray_tracing,
+        debug_view: settings.ray_debug,
+        ..Default::default()
+    });
+    renderer.set_gi(crate::scene::GiSettings {
+        enabled: settings.gi,
+        gather: settings.gi_gather.is_some(),
+        gather_resolution: settings.gi_gather.unwrap_or_default(),
+        debug_view: settings.gi_debug,
+        ..Default::default()
+    });
     for _ in 0..settings.frames.max(1) {
         // Extraction reads *world* transforms, and a freshly built scene has
         // only local ones — the propagation that derives them is a system, not
@@ -417,10 +491,12 @@ pub fn render(
 /// those finds no device at all on macOS.
 pub(crate) fn headless_instance() -> Arc<Instance> {
     let library = VulkanLibrary::new().expect("failed to load vulkan library");
+    let enabled_extensions = crate::gfx::vulkan::upscaler_instance_extensions(&library);
     Instance::new(
         library,
         InstanceCreateInfo {
             flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+            enabled_extensions,
             ..Default::default()
         },
     )

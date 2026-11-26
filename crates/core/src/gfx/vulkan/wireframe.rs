@@ -17,7 +17,11 @@
 //! for as long as the mode is on.
 //!
 //! **Over the shaded frame** the node attaches the prepass depth read-only and
-//! hides the edges the scene covers. The lines are drawn with the
+//! hides the edges the scene covers. Where the frame upscales, that depth is at
+//! the render extent and this pass at the output's, and a render pass cannot
+//! attach an image of another extent; there the depth is sampled instead and
+//! the test made in the fragment shader, against the farthest of the render
+//! texels round each pixel so that an edge is not lost to a coarser depth. The lines are drawn with the
 //! *unjittered* projection — they land on the resolved frame, where a jittered
 //! line would shimmer — while that depth was rasterised jittered, so an edge's
 //! depth is nudged toward the camera by a fixed fraction of itself to win
@@ -37,7 +41,7 @@ use crate::gfx::DrawList;
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     Binding, BindingResource, Blend, DepthCompare, DepthTest, Device, Encoder, GeometryStream,
-    GraphicsPipelineDesc, PipelineId, Viewport,
+    GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, TextureViewId, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -68,9 +72,23 @@ const WIDTH: f32 = 1.5;
 /// at a hundred metres still five centimetres.
 const NUDGE: f32 = 5e-4;
 
+/// How the covered edges over the shaded frame are hidden, if they are.
+#[derive(Clone, Copy, Debug)]
+pub enum Hidden {
+    /// Every edge drawn.
+    No,
+    /// By the depth the node attached.
+    Attached,
+    /// By this depth, sampled; the scale is render pixels per output pixel.
+    Sampled(TextureViewId, [f32; 2]),
+}
+
 pub struct WireframePass {
     over: PipelineId,
+    over_sampled: PipelineId,
     alone: PipelineId,
+    /// Nearest, for the gather the sampled test makes.
+    nearest: SamplerId,
     linear_output: bool,
 }
 
@@ -94,26 +112,44 @@ impl WireframePass {
                 }),
                 ..base
             }),
+            over_sampled: device.create_graphics_pipeline(&GraphicsPipelineDesc {
+                fragment: ShaderId::WireframeFragSampled.into(),
+                ..base
+            }),
             alone: device.create_graphics_pipeline(&base),
+            nearest: device.create_sampler(SamplerDesc {
+                linear: false,
+                mipmap_linear: false,
+                repeat: false,
+                compare: false,
+                anisotropy: None,
+                max_lod: Some(0.0),
+                lod_bias: 0.0,
+            }),
             linear_output: swapchain_format.is_srgb(),
         }
     }
 
-    /// Draw every object in `lists` as its edges. `depth` is whether the node
-    /// attached one, which decides the pipeline whatever the mode asked for.
+    /// Draw every object in `lists` as its edges. `hidden` is what the node
+    /// declared to hide them with, which decides the pipeline whatever the
+    /// mode asked for.
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
         device: &Device,
         builder: &mut Encoder,
         mode: Wireframe,
-        depth: bool,
+        hidden: Hidden,
         lists: &[DrawList<'_>],
         meshes: &[GpuMesh],
         view_proj: Mat4,
         extent: [u32; 2],
     ) {
-        let pipeline = if depth { self.over } else { self.alone };
+        let pipeline = match hidden {
+            Hidden::No => self.alone,
+            Hidden::Attached => self.over,
+            Hidden::Sampled(..) => self.over_sampled,
+        };
         let geometry = device.create_bind_group(
             pipeline,
             0,
@@ -135,6 +171,24 @@ impl WireframePass {
         });
         builder.bind_pipeline(pipeline);
         builder.bind_group(0, geometry);
+        let depth_scale = match hidden {
+            Hidden::Sampled(depth, scale) => {
+                let set = device.create_transient_bind_group(
+                    pipeline,
+                    1,
+                    &[Binding {
+                        binding: 0,
+                        resource: BindingResource::SampledTexture {
+                            view: depth,
+                            sampler: self.nearest,
+                        },
+                    }],
+                );
+                builder.bind_group(1, set);
+                scale
+            }
+            Hidden::No | Hidden::Attached => [0.0; 2],
+        };
 
         let color = match mode {
             Wireframe::OverShaded => OVER_SHADED,
@@ -146,14 +200,23 @@ impl WireframePass {
         } else {
             color
         };
-        let nudge = if depth { NUDGE } else { 0.0 };
+        let nudge = match hidden {
+            Hidden::No => 0.0,
+            Hidden::Attached | Hidden::Sampled(..) => NUDGE,
+        };
         for list in lists {
             for &index in list.order {
                 let item = &list.items[index as usize];
                 let Some(mesh) = meshes.get(item.mesh.0 as usize) else {
                     continue;
                 };
-                builder.push_constants(&push_words(view_proj * item.model, color, mesh, nudge));
+                builder.push_constants(&push_words(
+                    view_proj * item.model,
+                    color,
+                    mesh,
+                    nudge,
+                    depth_scale,
+                ));
                 builder.draw(mesh.span.index_count, 1, 0, 0);
             }
         }
@@ -161,9 +224,15 @@ impl WireframePass {
 }
 
 /// The push block both stages declare: the matrix, the colour, where the mesh
-/// sits in the shared geometry, the width and the nudge.
-fn push_words(mvp: Mat4, color: [f32; 4], mesh: &GpuMesh, nudge: f32) -> [u32; 24] {
-    let mut words = [0u32; 24];
+/// sits in the shared geometry, the width, the nudge and the depth's scale.
+fn push_words(
+    mvp: Mat4,
+    color: [f32; 4],
+    mesh: &GpuMesh,
+    nudge: f32,
+    depth_scale: [f32; 2],
+) -> [u32; 26] {
+    let mut words = [0u32; 26];
     for (word, float) in words
         .iter_mut()
         .zip(mvp.to_cols_array().iter().chain(&color))
@@ -174,6 +243,8 @@ fn push_words(mvp: Mat4, color: [f32; 4], mesh: &GpuMesh, nudge: f32) -> [u32; 2
     words[21] = mesh.span.vertex_offset as u32;
     words[22] = WIDTH.to_bits();
     words[23] = nudge.to_bits();
+    words[24] = depth_scale[0].to_bits();
+    words[25] = depth_scale[1].to_bits();
     words
 }
 

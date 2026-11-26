@@ -22,6 +22,15 @@
 //! Hand-wiring fifteen, with the editor depending on frame structure, is the
 //! point of no return.
 //!
+//! **Two extents, named rather than computed.** An image is sized against the
+//! render extent the scene is drawn at or the output extent it is presented
+//! at (or a fixed size), and the executor resolves both in one place. A pass
+//! never works out a size, and the compiler rejects one whose attachments sit
+//! at different extents, since a render pass covers one area. A frame that
+//! does not upscale is planned with the two as one — see
+//! [`GraphBuilder::upscale`] — so its plan is the one it had before they were
+//! told apart.
+//!
 //! # What v1 deliberately does not do
 //!
 //! - **Two queues at most, cut in one place.** A frame that asked for it is
@@ -72,7 +81,7 @@ pub use builder::{GraphBuilder, PassBuilder, PassId, PassKind};
 pub use compile::{FrameGraph, TransientImage, compile};
 pub use error::GraphError;
 pub use plan::Barrier;
-pub use resource::{Extent, ImageDesc, ImportedLayouts, ResourceId};
+pub use resource::{Extent, Extents, ImageDesc, ImportedLayouts, ResourceId};
 pub use schedule::{Queue, Segment};
 pub use sync::{AccessFlags, BufferUsage, ImageLayout, ImageUsage, PipelineStages};
 

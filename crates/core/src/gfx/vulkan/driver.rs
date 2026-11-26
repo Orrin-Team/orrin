@@ -49,6 +49,7 @@ use vulkano::pipeline::{
 };
 use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
 
+use super::accel::SceneAccel;
 use super::context::VkContext;
 use super::convert::{vk_buffer_usage, vk_format, vk_image_usage, vk_samples};
 use super::mesh::MeshArena;
@@ -60,9 +61,9 @@ use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, BufferId,
     ComputePipelineDesc, CullMode, DepthCompare, Encoder, Feature, GraphicsPipelineDesc, LoadOp,
-    MeshSpan, PipelineId, Pool, RenderTargets, SamplerDesc, SamplerId, ShaderModuleId, ShaderRef,
-    StoreOp, TextureDesc, TextureDimension, TextureSwizzle, TextureViewId, Topology, VertexFormat,
-    VertexStream, Viewport,
+    MeshSpan, PipelineId, Pool, RayInstance, RenderTargets, SamplerDesc, SamplerId, ShaderModuleId,
+    ShaderRef, StoreOp, TextureDesc, TextureDimension, TextureSwizzle, TextureViewId, Topology,
+    VertexFormat, VertexStream, Viewport,
 };
 use crate::gfx::shaders::{CompiledBindings, CompiledShader};
 
@@ -100,6 +101,8 @@ pub struct VkDriver {
     /// because every pass binds the same buffers; a pass names a mesh by its
     /// span and never holds the arena.
     arena: RwLock<MeshArena>,
+    /// What a ray is traced against, on a device that traces. See `accel`.
+    accel: Option<Mutex<SceneAccel>>,
     bind_groups: Mutex<Pool<Arc<DescriptorSet>>>,
     /// Texture uploads, none of which the CPU waits for. See `upload`.
     uploads: super::upload::Uploads,
@@ -161,11 +164,15 @@ impl VkDriver {
             },
         );
         let arena = RwLock::new(MeshArena::new(&ctx, frames_in_flight));
+        let accel = ctx
+            .ray_tracing
+            .then(|| Mutex::new(SceneAccel::new(&ctx, frames_in_flight)));
         let uploads = super::upload::Uploads::new(&ctx);
         Self {
             ctx,
             frame: AtomicU64::new(0),
             arena,
+            accel,
             views: Mutex::new(Pool::new(frames_in_flight)),
             buffers: Mutex::new(Pool::new(frames_in_flight)),
             samplers: Mutex::new(Pool::new(frames_in_flight)),
@@ -184,10 +191,42 @@ impl VkDriver {
     /// Put a mesh into the shared arena and say where it landed, with its
     /// object-space bounds.
     pub fn upload_mesh(&self, vertices: &[Vertex], indices: &[u32]) -> (MeshSpan, Aabb) {
-        self.arena
+        let placed = self
+            .arena
             .write()
             .expect("a pass panicked while using the device")
-            .upload(&self.ctx, vertices, indices)
+            .upload(&self.ctx, vertices, indices);
+        if let Some(accel) = &self.accel {
+            accel.lock().unwrap().add(placed.0, vertices.len() as u32);
+        }
+        placed
+    }
+
+    fn accel(&self) -> std::sync::MutexGuard<'_, SceneAccel> {
+        self.accel
+            .as_ref()
+            .expect("a pass traced rays on a device that reports no ray tracing")
+            .lock()
+            .expect("a pass panicked while using the device")
+    }
+
+    pub fn prepare_ray_scene(&self, instances: &[RayInstance]) -> u32 {
+        let arena = self
+            .arena
+            .read()
+            .expect("a pass panicked while using the device");
+        self.accel().prepare(
+            &self.ctx,
+            &arena,
+            self.frame.load(Ordering::Relaxed),
+            instances,
+        )
+    }
+
+    pub fn ray_scene_bytes(&self) -> u64 {
+        self.accel
+            .as_ref()
+            .map_or(0, |accel| accel.lock().unwrap().bytes())
     }
 
     pub fn replace_mesh(
@@ -201,8 +240,15 @@ impl VkDriver {
             .arena
             .write()
             .expect("a pass panicked while using the device");
-        arena.retire(old, old_vertices, self.frame.load(Ordering::Relaxed));
-        arena.upload(&self.ctx, vertices, indices)
+        let frame = self.frame.load(Ordering::Relaxed);
+        arena.retire(old, old_vertices, frame);
+        let placed = arena.upload(&self.ctx, vertices, indices);
+        if let Some(accel) = &self.accel {
+            let mut accel = accel.lock().unwrap();
+            accel.retire(old, frame);
+            accel.add(placed.0, vertices.len() as u32);
+        }
+        placed
     }
 
     #[cfg(test)]
@@ -325,6 +371,7 @@ impl VkDriver {
         };
         match feature {
             Feature::BlockCompression => self.ctx.samples_bc,
+            Feature::RayTracing => self.ctx.ray_tracing,
             Feature::CoverageTexture => {
                 let device = &self.ctx.device;
                 let swizzle = !device.enabled_extensions().khr_portability_subset
@@ -442,6 +489,31 @@ impl VkDriver {
             .clear_depth_stencil_image(vulkano::command_buffer::ClearDepthStencilImageInfo {
                 clear_value: vulkano::format::ClearDepthStencilValue { depth, stencil: 0 },
                 ..vulkano::command_buffer::ClearDepthStencilImageInfo::image(image.clone())
+            })
+            .image_barrier(super::record::to_shader_read(
+                image.clone(),
+                super::record::whole_image(&image),
+                vulkano::image::ImageLayout::TransferDstOptimal,
+            ));
+        builder.submit_and_wait(&self.ctx);
+    }
+
+    /// [`fill_depth`](Self::fill_depth) for a colour texture: for one read
+    /// before anything has written it, which has to hold a value meanwhile.
+    #[cfg(all(any(feature = "fsr", feature = "dlss"), windows))]
+    pub fn fill_color(&self, texture: TextureViewId, color: [f32; 4]) {
+        let view = lookup(&self.views, texture.0, "texture view");
+        let image = view.image().clone();
+        let mut builder = Recorder::new(&self.ctx);
+        builder
+            .image_barrier(super::record::to_transfer_dst(
+                image.clone(),
+                super::record::whole_image(&image),
+                vulkano::image::ImageLayout::Undefined,
+            ))
+            .clear_color_image(vulkano::command_buffer::ClearColorImageInfo {
+                clear_value: vulkano::format::ClearColorValue::Float(color),
+                ..vulkano::command_buffer::ClearColorImageInfo::image(image.clone())
             })
             .image_barrier(super::record::to_shader_read(
                 image.clone(),
@@ -591,6 +663,15 @@ impl VkDriver {
                 .max_lod
                 .unwrap_or(vulkano::image::sampler::LOD_CLAMP_NONE),
             anisotropy: desc.anisotropy,
+            mip_lod_bias: {
+                let limit = self
+                    .ctx
+                    .device
+                    .physical_device()
+                    .properties()
+                    .max_sampler_lod_bias;
+                desc.lod_bias.clamp(-limit, limit)
+            },
             ..Default::default()
         };
         let sampler =
@@ -978,6 +1059,23 @@ impl VkDriver {
         desc: &ComputePipelineDesc,
         immutable_samplers: &[(u32, u32, SamplerId)],
     ) -> Result<PipelineId, String> {
+        self.build_compute_pipeline(desc, immutable_samplers, None)
+    }
+
+    pub fn try_create_compute_pipeline_over_textures(
+        &self,
+        desc: &ComputePipelineDesc,
+        texture_set: u32,
+    ) -> Result<PipelineId, String> {
+        self.build_compute_pipeline(desc, &[], Some(texture_set))
+    }
+
+    fn build_compute_pipeline(
+        &self,
+        desc: &ComputePipelineDesc,
+        immutable_samplers: &[(u32, u32, SamplerId)],
+        partial_texture_set: Option<u32>,
+    ) -> Result<PipelineId, String> {
         let device = &self.ctx.device;
         let (entry, name) = self.entry_point(desc.shader)?;
         let named = |e: &dyn std::fmt::Display| format!("{name}: {e}");
@@ -987,6 +1085,10 @@ impl VkDriver {
             immutable_binding(&mut layout_info, set, binding)
                 .map_err(|e| named(&e))?
                 .immutable_samplers = vec![lookup(&self.samplers, sampler.0, "sampler")];
+        }
+        if let Some(set) = partial_texture_set {
+            self.ctx
+                .mark_texture_array_partial(&mut layout_info, set as usize);
         }
         let info = layout_info
             .into_pipeline_layout_create_info(device.clone())
@@ -1212,6 +1314,10 @@ impl VkDriver {
                         .expect("a pass panicked while using the device")
                         .storage(stream),
                 ),
+                BindingResource::SceneAccel => WriteDescriptorSet::acceleration_structure(
+                    binding.binding,
+                    self.accel().scene(),
+                ),
             });
             index += 1;
         }
@@ -1418,6 +1524,15 @@ impl<'a> VkEncoder<'a> {
 
     fn layout(&self) -> &Arc<PipelineLayout> {
         self.bound.as_ref().expect("no pipeline is bound").layout()
+    }
+
+    /// The recording itself, for a pass whose body a vendor's library
+    /// records. Forgets the bound pipeline, since what the library binds
+    /// replaces it.
+    #[cfg(all(any(feature = "fsr", feature = "dlss"), windows))]
+    pub(super) fn recorder(&mut self) -> &mut Recorder {
+        self.bound = None;
+        self.recorder
     }
 
     /// The viewport, and a scissor covering exactly it — every pipeline
@@ -1732,8 +1847,24 @@ impl<'a> VkEncoder<'a> {
         self.recorder.draw_indexed_indirect(commands);
     }
 
+    pub fn build_mesh_accel(&mut self) {
+        self.driver.accel().record_meshes(self.recorder);
+    }
+
+    pub fn build_scene_accel(&mut self) {
+        self.driver.accel().record_scene(self.recorder);
+    }
+
     pub fn dispatch(&mut self, groups: [u32; 3]) {
         self.recorder.dispatch(groups);
+    }
+
+    pub fn dispatch_indirect(&mut self, command: BufferId) {
+        let size = size_of::<vulkano::command_buffer::DispatchIndirectCommand>() as u64;
+        let command = lookup(&self.driver.buffers, command.0, "buffer")
+            .slice(0..size)
+            .reinterpret::<[vulkano::command_buffer::DispatchIndirectCommand]>();
+        self.recorder.dispatch_indirect(command);
     }
 
     pub fn draw(&mut self, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
@@ -2083,6 +2214,7 @@ pub(crate) mod tests {
             compare: false,
             anisotropy: None,
             max_lod: None,
+            lod_bias: 0.0,
         });
         (mask, sampler)
     }

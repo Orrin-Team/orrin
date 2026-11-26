@@ -26,6 +26,7 @@ use orrin_core::gfx::format::Format;
 use orrin_core::gfx::graph::ImageDesc;
 use orrin_core::gfx::vulkan::frame::{FrameConfig, ShotView, declare};
 use orrin_core::gfx::vulkan::wireframe::Wireframe;
+use orrin_core::scene::Upscaling;
 
 /// The swapchain format the baseline is written against. Real ones vary by
 /// surface; the plan does not depend on it, and pinning it keeps the file from
@@ -77,6 +78,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // MSAA with the diffusion on, which is the five-attachment forward pass:
@@ -113,6 +122,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         (
@@ -144,6 +161,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // Four cascades write four layers of one image, which the graph tracks
@@ -181,6 +206,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // SSAO off is a different graph, not a flag read at record time: the
@@ -217,6 +250,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // The shape that proves the prepass belongs to the frame rather than to
@@ -251,6 +292,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // Metering off is the other shape that ships. Worth baselining for one
@@ -287,6 +336,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // A window too small for a real chain still gets one level, and that
@@ -322,6 +379,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // The froxel fog, with the cascades it exists to read. Worth baselining
@@ -361,6 +426,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // The whole optical chain at once: lens, then shutter, then sensor.
@@ -397,6 +470,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // The other shape that proves the prepass belongs to the frame rather
@@ -433,6 +514,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // Reflections are the first thing to sit *between* shading and the
@@ -469,6 +558,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // And the same without a resolve behind it, which is the shape where
@@ -503,6 +600,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // What actually ships in the editor: the march sits between the prepass
@@ -539,6 +644,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // And the march on its own, which is the shape that proves it keeps the
@@ -573,6 +686,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // The punctual atlas: one pass however many lights cast, because a tile
@@ -608,6 +729,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // And the atlas with no cascades, which is an ordinary scene: an indoor
@@ -643,6 +772,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // What ships: transparency accumulates after the reflections and before
@@ -680,6 +817,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // And transparency on its own, which is the shape that proves it keeps
@@ -715,6 +860,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // Both non-opaque queues at once, which is the shape that pins the
@@ -751,6 +904,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // And refraction on its own, which proves it keeps the geometry prepass
@@ -785,6 +946,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // Subsurface scattering is the first thing to change the *forward pass's
@@ -824,6 +993,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // And on its own, which is the shape that proves the diffusion keeps the
@@ -859,6 +1036,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         (
@@ -890,6 +1075,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // The split, on the frame the editor actually runs. Every configuration
@@ -933,6 +1126,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // The same frame with the depth test on, because what it adds is a
@@ -971,6 +1172,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         (
@@ -1002,6 +1211,14 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
             },
         ),
         // And the frame the split is *for*: every optical stage on, which is
@@ -1038,6 +1255,104 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 wireframe: None,
                 material_preview: false,
                 screenshot: None,
+                ray_tracing: false,
+                ray_debug: false,
+                ray_reflections: false,
+                ray_path_trace: false,
+                gi_probes: 0,
+                gi_gather: 0,
+                upscaling: Upscaling::Native,
+                vendor_resolve: false,
+            },
+        ),
+        // A frame that traces: the two builds at its head and the traced scene
+        // drawn over the tonemap. On the split frame, because the scene's
+        // structure is the one resource here that a build on the graphics queue
+        // writes while a reader may sit on the other.
+        (
+            "editor frame, the traced scene drawn in place of the frame",
+            FrameConfig {
+                ray_tracing: true,
+                ray_debug: true,
+                async_compute: true,
+                ..reference_config(false, true)
+            },
+        ),
+        // The irradiance volumes' four passes behind the scene's build, and
+        // every pass that lights a surface reading their atlases and their
+        // probes. On a device with a second queue, which the frame declines:
+        // the cache is shaded from the scene's own textures.
+        (
+            "editor frame, lit by the irradiance volumes",
+            FrameConfig {
+                ray_tracing: true,
+                gi_probes: 16,
+                gi_gather: 0,
+                async_compute: true,
+                transparency: true,
+                refraction: true,
+                ..reference_config(false, true)
+            },
+        ),
+        // The final gather's five dispatches between the prepass and the
+        // forward pass, its rays reading TAA's history and claiming the
+        // cache's cells after the cache is shaded.
+        (
+            "editor frame, lit by the volumes and the final gather",
+            FrameConfig {
+                ray_tracing: true,
+                gi_probes: 16,
+                gi_gather: 1,
+                async_compute: true,
+                transparency: true,
+                refraction: true,
+                ..reference_config(false, true)
+            },
+        ),
+        // Rendered at half the output each way and resolved up to it. The
+        // passes are the frame's own; what moves is which images share memory
+        // — none across the two extents — and the wireframe, which samples the
+        // prepass depth under its pixels rather than attaching it.
+        (
+            "editor frame, upscaled, with the lens, the shutter and the wireframe",
+            FrameConfig {
+                dof: true,
+                motion_blur: true,
+                overlay: true,
+                wireframe: Some(Wireframe::OverShaded),
+                upscaling: Upscaling::Performance,
+                vendor_resolve: false,
+                ..reference_config(false, true)
+            },
+        ),
+        // The same frame resolved by a vendor's upscaler: the node reads what
+        // the engine's resolve reads and writes a transient, with no history
+        // of the engine's, and the frame is not split across queues although
+        // the device offers a second.
+        (
+            "editor frame, upscaled by a vendor's upscaler",
+            FrameConfig {
+                dof: true,
+                motion_blur: true,
+                overlay: true,
+                wireframe: Some(Wireframe::OverShaded),
+                upscaling: Upscaling::Performance,
+                vendor_resolve: true,
+                async_compute: true,
+                ..reference_config(false, true)
+            },
+        ),
+        // And with the blended queues in it: the reactive mask is drawn from
+        // what both composites blended by, between them and the resolve.
+        (
+            "editor frame with glass, upscaled by a vendor's upscaler",
+            FrameConfig {
+                transparency: true,
+                refraction: true,
+                overlay: true,
+                upscaling: Upscaling::Quality,
+                vendor_resolve: true,
+                ..reference_config(false, true)
             },
         ),
     ]
@@ -1237,6 +1552,14 @@ fn the_shadow_atlas_is_sixteen_bit_and_the_camera_depth_is_not() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     })
     .unwrap();
 
@@ -1278,6 +1601,14 @@ fn reference_config(msaa: bool, presents: bool) -> FrameConfig {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     }
 }
 
@@ -1365,6 +1696,12 @@ fn a_screenshot_adds_one_reader_and_changes_no_image_the_frame_owns() {
         let without = declare(off).unwrap().graph;
         let with = declare(FrameConfig {
             screenshot: Some(view),
+            ray_tracing: false,
+            ray_debug: false,
+            ray_reflections: false,
+            ray_path_trace: false,
+            gi_probes: 0,
+            gi_gather: 0,
             ..off
         })
         .unwrap()
@@ -1461,6 +1798,14 @@ fn an_empty_selection_runs_no_outline_and_no_gizmo() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     };
     let passes = |outline, gizmo| {
         let frame = declare(config(outline, gizmo)).unwrap();
@@ -1525,6 +1870,14 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     })
     .unwrap();
 
@@ -1586,6 +1939,14 @@ fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     })
     .unwrap();
 
@@ -1643,6 +2004,14 @@ fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     })
     .unwrap();
 
@@ -1709,6 +2078,14 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     })
     .unwrap();
 
@@ -1762,6 +2139,14 @@ fn the_gizmo_draws_between_the_tonemap_and_the_overlay() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     };
     for async_compute in [false, true] {
         let frame = declare(config(true, async_compute)).unwrap();
@@ -1866,6 +2251,14 @@ fn the_selection_outline_is_masked_then_drawn_under_the_gizmo() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     };
     let frame = declare(config(true)).unwrap();
     let order: Vec<&str> = frame
@@ -1939,6 +2332,14 @@ fn transparency_attaches_the_prepass_depth_read_only() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     })
     .unwrap();
 
@@ -2004,6 +2405,14 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     };
 
     let plan = format!("{}", declare(base).unwrap().graph);
@@ -2107,6 +2516,14 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     })
     .unwrap();
 
@@ -2173,6 +2590,14 @@ fn refraction_attaches_the_prepass_depth_read_only() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     })
     .unwrap();
 
@@ -2230,6 +2655,14 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     })
     .unwrap();
 
@@ -2312,6 +2745,14 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     };
 
     let consumers: [Consumer; 10] = [
@@ -2412,6 +2853,14 @@ fn nothing_draws_before_the_cull_pass_has_filled_the_commands() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
     })
     .unwrap();
 
@@ -2458,6 +2907,391 @@ fn nothing_draws_before_the_cull_pass_has_filled_the_commands() {
     );
 }
 
+/// The scene's acceleration structure is built over the meshes', and a frame
+/// builds some of those too. Each step reads what the one before wrote on the
+/// device, so each needs the previous build finished and visible: the scene's
+/// build waits on the meshes' at the build stage, and a shader that traces
+/// waits on the scene's.
+#[test]
+fn the_traced_scene_is_built_over_the_meshes_before_anything_traces_it() {
+    let frame = declare(FrameConfig {
+        ray_tracing: true,
+        ray_debug: true,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+
+    let order: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&pass| frame.graph.pass_name(pass))
+        .collect();
+    let at = |name: &str| {
+        order
+            .iter()
+            .position(|&pass| pass == name)
+            .unwrap_or_else(|| panic!("{name} was not scheduled:\n{order:?}"))
+    };
+    assert!(at("ray_meshes") < at("ray_scene"), "{order:?}");
+    assert!(at("ray_scene") < at("ray_debug"), "{order:?}");
+    assert!(at("tonemap") < at("ray_debug"), "{order:?}");
+
+    let plan = format!("{}", frame.graph);
+    assert!(
+        plan.contains(
+            "  ! ray_meshes src AccelerationStructureBuild/AccelerationStructureWrite \
+             dst AccelerationStructureBuild/AccelerationStructureRead\n"
+        ),
+        "the scene's build must wait for the meshes' at the build stage:\n{plan}",
+    );
+    assert!(
+        plan.contains(
+            "  ! ray_scene src AccelerationStructureBuild/AccelerationStructureWrite \
+             dst VertexShader|FragmentShader|ComputeShader/AccelerationStructureRead\n"
+        ),
+        "a shader that traces must wait for the scene's build:\n{plan}",
+    );
+}
+
+/// The reflections fall back to a traced ray in both of the passes that trace
+/// one: each declares the scene it traces, and the first waits for its build.
+/// A hit is shaded from the scene's own textures and geometry, which the
+/// graphics queue's family owns, so the frame is not split while they trace.
+#[test]
+fn traced_reflections_wait_for_the_scene_in_both_passes_that_trace() {
+    let frame = declare(FrameConfig {
+        ssr: true,
+        ray_tracing: true,
+        ray_reflections: true,
+        async_compute: true,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    assert!(frame.ids.ssr.unwrap().traced);
+    assert_eq!(frame.graph.segments().len(), 1, "{}", frame.graph);
+
+    let plan = format!("{}", frame.graph);
+    assert_eq!(
+        plan.matches("     ray_scene AccelerationStructureRead\n")
+            .count(),
+        2,
+        "the trace and the composite must each declare the scene they trace:\n{plan}",
+    );
+    assert_eq!(
+        plan.matches("  ! ray_scene src ").count(),
+        1,
+        "the first pass to trace must wait for the scene's build, once:\n{plan}",
+    );
+
+    // Without the setting the same frame binds the screen-only pair and
+    // touches no acceleration structure.
+    let frame = declare(FrameConfig {
+        ssr: true,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    assert!(!frame.ids.ssr.unwrap().traced);
+    assert!(!format!("{}", frame.graph).contains("ray_"));
+}
+
+/// The reference stands in for the frame where it is tonemapped and nowhere
+/// before: the exposure is still metered from the rasterised frame, so the two
+/// are shown alike and differ only in light, and nothing of the frame is
+/// culled for the reference's sake, so no history is lost to having looked.
+#[test]
+fn the_path_traced_reference_is_shown_at_the_exposure_of_the_frame_it_replaces() {
+    let frame = declare(FrameConfig {
+        ray_tracing: true,
+        ray_path_trace: true,
+        gi_probes: 0,
+        gi_gather: 0,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    let path = frame.ids.path.expect("the reference's images");
+    assert_eq!(frame.ids.scene_color, path.mean);
+    assert_ne!(frame.ids.metered_color, path.mean);
+    assert!(frame.graph.culled().is_empty(), "{}", frame.graph);
+
+    let plan = format!("{}", frame.graph);
+    let reads = |pass: &str| {
+        let from = plan
+            .find(&format!(" pass {pass} ["))
+            .unwrap_or_else(|| panic!("{pass} was not scheduled:\n{plan}"));
+        let rest = &plan[from + 1..];
+        rest[..rest.find(" pass ").unwrap_or(rest.len())].contains("     path_mean Sampled\n")
+    };
+    assert!(reads("tonemap"), "{plan}");
+    assert!(!reads("luminance_histogram"), "{plan}");
+    assert!(
+        plan.contains("     ray_scene AccelerationStructureRead\n     taa_color Sampled\n"),
+        "the reference must wait for the scene and for the frame it replaces:\n{plan}",
+    );
+}
+
+/// The irradiance volumes' four passes run in the one order the cache
+/// allows — the probes, from last frame's rays and cells, then this frame's
+/// rays, the cache's list, and the cells shaded — and each waits for the last
+/// on the device: the shading for the update's volumes, its dispatch for the
+/// list's count. Every pass that lights a surface reads the volumes after
+/// their update, and the frame is not split, since the shading reads the
+/// scene's own textures.
+#[test]
+fn the_irradiance_volumes_are_updated_before_anything_lights_with_them() {
+    let frame = declare(FrameConfig {
+        ray_tracing: true,
+        gi_probes: 16,
+        gi_gather: 0,
+        async_compute: true,
+        ssr: true,
+        ray_reflections: true,
+        transparency: true,
+        refraction: true,
+        volumetric_fog: true,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    assert!(frame.ids.gi.is_some());
+    assert_eq!(frame.graph.segments().len(), 1, "{}", frame.graph);
+    assert!(frame.graph.culled().is_empty(), "{}", frame.graph);
+
+    let order: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&pass| frame.graph.pass_name(pass))
+        .collect();
+    let at = |name: &str| {
+        order
+            .iter()
+            .position(|&pass| pass == name)
+            .unwrap_or_else(|| panic!("{name} was not scheduled:\n{order:?}"))
+    };
+    assert!(at("ray_scene") < at("gi_trace"), "{order:?}");
+    assert!(at("gi_update") < at("gi_trace"), "{order:?}");
+    assert!(at("gi_trace") < at("gi_cache_compact"), "{order:?}");
+    assert!(at("gi_cache_compact") < at("gi_cache_shade"), "{order:?}");
+    for reader in [
+        "forward",
+        "oit_accumulate",
+        "refraction_draw",
+        "ssr_trace",
+        "ssr_resolve",
+        "fog_scatter",
+    ] {
+        assert!(at("gi_update") < at(reader), "{reader}: {order:?}");
+    }
+
+    let plan = format!("{}", frame.graph);
+    assert!(
+        plan.contains(
+            "  ! gi_args src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|\
+             ShaderStorageWrite dst DrawIndirect/IndirectCommandRead\n"
+        ),
+        "the shading's dispatch must wait for the count the compaction wrote:\n{plan}",
+    );
+    // The outlying rays' part of the bounce tile is the update's alone.
+    assert_eq!(plan.matches("     gi_outlier ").count(), 1, "{plan}");
+    assert!(plan.contains("     gi_outlier StorageWrite\n"), "{plan}");
+
+    // Off, nothing of them is declared, and the frame is the one it was.
+    let off = declare(FrameConfig {
+        ray_tracing: true,
+        ray_debug: true,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    assert!(off.ids.gi.is_none());
+    assert!(!format!("{}", off.graph).contains("gi_"));
+}
+
+/// The final gather runs after the cache is shaded, whose light its rays read
+/// and whose cells they claim, and before the forward pass that reads what it
+/// leaves; its accumulation is a history, so the temporal pass reads one
+/// allocation and writes the other, and the cache's shading reads last
+/// frame's gather rays before this frame's are written. Blended and
+/// refractive surfaces keep the volumes and never wait for it.
+#[test]
+fn the_final_gather_runs_between_the_cache_and_the_forward_pass() {
+    use orrin_core::gfx::graph::Extent;
+    let frame = declare(FrameConfig {
+        ray_tracing: true,
+        gi_probes: 16,
+        gi_gather: 2,
+        async_compute: true,
+        transparency: true,
+        refraction: true,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    assert!(frame.ids.gather.is_some(), "the gather was asked for");
+    assert_eq!(frame.graph.segments().len(), 1, "{}", frame.graph);
+    assert!(frame.graph.culled().is_empty(), "{}", frame.graph);
+
+    let order: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&pass| frame.graph.pass_name(pass))
+        .collect();
+    let at = |name: &str| {
+        order
+            .iter()
+            .position(|&pass| pass == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} was not scheduled:
+{order:?}"
+                )
+            })
+    };
+    let chain = [
+        "geometry_prepass",
+        "gi_gather",
+        "gi_gather_temporal",
+        "gi_gather_blur_x",
+        "gi_gather_blur_y",
+        "gi_gather_blur_wide_x",
+        "gi_gather_blur_wide_y",
+        "gi_gather_upscale",
+        "forward",
+    ];
+    for pair in chain.windows(2) {
+        assert!(at(pair[0]) < at(pair[1]), "{pair:?}: {order:?}");
+    }
+    assert!(at("gi_cache_shade") < at("gi_gather"), "{order:?}");
+    assert!(at("gi_gather") < at("taa_resolve"), "{order:?}");
+
+    let desc = image_desc(&frame.graph, "gi_gather_raw").unwrap();
+    assert_eq!(desc.extent, Extent::RenderDiv(2));
+    assert_eq!(desc.array_layers, Some(4));
+    let desc = image_desc(&frame.graph, "gi_gather_irradiance").unwrap();
+    assert_eq!(desc.extent, Extent::Render);
+    assert_eq!(desc.array_layers, Some(3));
+
+    let plan = format!("{}", frame.graph);
+    let reads = |pass: &str, line: &str| {
+        let from = plan.find(&format!(" pass {pass} [")).unwrap_or_else(|| {
+            panic!(
+                "{pass} was not scheduled:
+{plan}"
+            )
+        });
+        let rest = &plan[from + 1..];
+        rest[..rest.find(" pass ").unwrap_or(rest.len())].contains(line)
+    };
+    assert!(
+        reads(
+            "forward",
+            "     gi_gather_irradiance Sampled
+"
+        ),
+        "{plan}"
+    );
+    assert!(!reads("gi_gather", "taa_history"), "{plan}");
+    assert!(
+        reads(
+            "gi_gather_temporal",
+            "     gi_gather_history Sampled
+"
+        ),
+        "{plan}"
+    );
+    assert!(
+        reads(
+            "gi_gather_temporal",
+            "     gi_gather_accumulated StorageWrite
+"
+        ),
+        "{plan}"
+    );
+    for pass in ["oit_accumulate", "refraction_draw"] {
+        assert!(!reads(pass, "gi_gather"), "{pass}: {plan}");
+    }
+
+    // Off, nothing of it is declared, and the volumes' frame is the one it
+    // was.
+    let off = declare(FrameConfig {
+        ray_tracing: true,
+        gi_probes: 16,
+        gi_gather: 0,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    assert!(off.ids.gather.is_none());
+    assert!(!format!("{}", off.graph).contains("gi_gather"));
+}
+
+/// The fog's traced light reads the cache after it is shaded and after the
+/// gather has claimed its cells, and the froxels read it after it is traced.
+/// Without the volumes it is not declared, and the fog is the frame it was.
+#[test]
+fn the_fogs_traced_light_runs_between_the_cache_and_the_froxels() {
+    let frame = declare(FrameConfig {
+        ray_tracing: true,
+        gi_probes: 16,
+        gi_gather: 1,
+        volumetric_fog: true,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    let light = frame
+        .ids
+        .fog
+        .and_then(|fog| fog.light)
+        .expect("the volumes are live, so the fog traces its light");
+    assert!(frame.graph.culled().is_empty(), "{}", frame.graph);
+    let order: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&pass| frame.graph.pass_name(pass))
+        .collect();
+    let at = |name: &str| {
+        order
+            .iter()
+            .position(|&pass| pass == name)
+            .unwrap_or_else(|| panic!("{name} was not scheduled:\n{order:?}"))
+    };
+    assert!(at("gi_cache_shade") < at("fog_light"), "{order:?}");
+    assert!(at("gi_gather") < at("fog_light"), "{order:?}");
+    assert!(at("fog_light") < at("fog_scatter"), "{order:?}");
+    assert_eq!(frame.graph.resource_name(light), "fog_light");
+    let state = frame
+        .ids
+        .fog
+        .and_then(|fog| fog.light_state)
+        .expect("a traced light keeps its rays' disagreement");
+    assert_eq!(frame.graph.resource_name(state), "fog_light_state");
+    let plan = format!("{}", frame.graph);
+    assert_eq!(
+        plan.matches("     fog_light_state ").count(),
+        1,
+        "only the traced light touches its state: {plan}"
+    );
+
+    let off = declare(FrameConfig {
+        volumetric_fog: true,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    let ids = off.ids.fog.expect("the fog was asked for");
+    assert!(ids.light.is_none() && ids.light_state.is_none());
+    assert!(!format!("{}", off.graph).contains("fog_light"));
+}
+
+/// A device that cannot trace, or a frame in which nothing does, declares
+/// neither build: the structures cost a frame that traces nothing as much as
+/// one that does.
+#[test]
+fn a_frame_that_traces_nothing_builds_no_acceleration_structure() {
+    let frame = declare(reference_config(false, true)).unwrap();
+    assert!(frame.ids.ray.is_none());
+    let plan = format!("{}", frame.graph);
+    assert!(!plan.contains("ray_"), "{plan}");
+}
+
 /// Occlusion culling reads a depth pyramid the frame has not built yet, and the
 /// whole of its soundness is that this is deliberate: the pyramid the cull
 /// samples is the *previous* frame's, because the one over this frame's depth
@@ -2477,6 +3311,12 @@ fn the_occlusion_pyramid_the_cull_reads_is_not_the_one_the_frame_builds() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
         ..occlusion_base()
     })
     .unwrap();
@@ -2547,6 +3387,12 @@ fn occlusion_culling_keeps_the_prepass_alive_on_its_own() {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
         ..occlusion_base()
     })
     .unwrap();
@@ -2590,6 +3436,336 @@ fn occlusion_base() -> FrameConfig {
         wireframe: None,
         material_preview: false,
         screenshot: None,
+        ray_tracing: false,
+        ray_debug: false,
+        ray_reflections: false,
+        ray_path_trace: false,
+        gi_probes: 0,
+        gi_gather: 0,
+        upscaling: Upscaling::Native,
+        vendor_resolve: false,
+    }
+}
+
+/// A frame that renders below its output, with every pass that can read across
+/// the two extents: the whole optical chain, the blended queues, the froxels,
+/// and the editor's wireframe and screenshot over it.
+fn upscaled_config(upscaling: Upscaling) -> FrameConfig {
+    FrameConfig {
+        ssr: true,
+        subsurface: true,
+        transparency: true,
+        refraction: true,
+        volumetric_fog: true,
+        motion_blur: true,
+        dof: true,
+        contact_shadows: true,
+        overlay: true,
+        outline: true,
+        gizmo: true,
+        wireframe: Some(Wireframe::OverShaded),
+        screenshot: Some(ShotView::Editor),
+        shadow_atlas: 2048,
+        upscaling,
+        ..reference_config(false, true)
+    }
+}
+
+/// The two extents meet at the temporal resolve and nowhere else. A pass that
+/// writes at the output extent reads nothing at the render extent but what the
+/// resolve reads, or the prepass's depth and motion under its own pixel; a pass
+/// that writes at the render extent reads nothing at the output's. An image
+/// declared at the wrong one is a scene pass paying the output's cost, or a post
+/// pass reading a fraction of the frame as though it were all of it.
+#[test]
+fn an_upscaled_frame_meets_its_two_extents_at_the_resolve() {
+    use orrin_core::gfx::graph::Extent;
+    let graph = declare(upscaled_config(Upscaling::Performance))
+        .unwrap()
+        .graph;
+    assert!(graph.upscaled());
+    let at_output = |id| {
+        let desc = image_desc(&graph, graph.resource_name(id))?;
+        Some(matches!(desc.extent, Extent::Output | Extent::OutputDiv(_)))
+    };
+    assert_eq!(
+        at_output(
+            graph
+                .imported_images()
+                .find(|(id, _)| graph.resource_name(*id) == "swapchain_color")
+                .unwrap()
+                .0
+        ),
+        Some(true)
+    );
+    let mut resolves = 0;
+    for &pass in graph.order() {
+        let name = graph.pass_name(pass);
+        let accesses = graph.accesses(pass);
+        let writes = |output: bool| {
+            accesses
+                .iter()
+                .any(|&(id, access)| access.is_write() && at_output(id) == Some(output))
+        };
+        let reads = |output: bool| {
+            accesses
+                .iter()
+                .filter(move |&&(id, access)| !access.is_write() && at_output(id) == Some(output))
+                .map(|&(id, _)| graph.resource_name(id))
+        };
+        if writes(true) {
+            for read in reads(false) {
+                if name == "taa_resolve" {
+                    continue;
+                }
+                assert!(
+                    ["prepass_depth", "prepass_velocity"].contains(&read),
+                    "`{name}` writes at the output extent and reads `{read}` at the render extent",
+                );
+            }
+        }
+        if writes(false) {
+            let read: Vec<_> = reads(true).collect();
+            assert!(
+                read.is_empty(),
+                "`{name}` writes at the render extent and reads {read:?} at the output extent",
+            );
+        }
+        resolves += usize::from(name == "taa_resolve" && writes(true) && reads(false).count() > 0);
+    }
+    assert_eq!(
+        resolves, 1,
+        "the resolve is where the frame crosses to the output extent"
+    );
+}
+
+/// A vendor's upscaler is handed the resolve's inputs in the layout its
+/// states name and writes an output-extent image it is handed as storage,
+/// and that is the whole node: the engine's history is not declared, so it is
+/// neither allocated nor transitioned. Its own images belong to the queue
+/// family it ran on first, so the frame stays on one queue.
+#[test]
+fn a_vendor_resolve_reads_the_resolves_inputs_and_keeps_no_history_of_the_engines() {
+    use orrin_core::gfx::graph::{Access, Extent};
+    let frame = declare(FrameConfig {
+        vendor_resolve: true,
+        async_compute: true,
+        ..upscaled_config(Upscaling::Quality)
+    })
+    .unwrap();
+    let graph = &frame.graph;
+    let resolve = *graph
+        .order()
+        .iter()
+        .find(|&&pass| graph.pass_name(pass) == "taa_resolve")
+        .expect("the frame resolves");
+    let mut declared: Vec<_> = graph
+        .accesses(resolve)
+        .iter()
+        .map(|&(id, access)| (graph.resource_name(id), access))
+        .collect();
+    declared.sort_by_key(|&(name, _)| name);
+    assert_eq!(
+        declared,
+        [
+            ("prepass_depth", Access::Sampled),
+            ("prepass_velocity", Access::Sampled),
+            ("reactive_mask", Access::Sampled),
+            ("refraction_color", Access::Sampled),
+            ("taa_color", Access::StorageWrite),
+            ("upscaler_exposure_history", Access::Sampled),
+        ]
+    );
+    assert_eq!(
+        image_desc(graph, "taa_color").map(|desc| desc.extent),
+        Some(Extent::Output)
+    );
+    assert!(
+        graph
+            .transient_images()
+            .any(|(id, _)| graph.resource_name(id) == "taa_color"),
+        "the output is the frame's own, not an import"
+    );
+    assert!(image_desc(graph, "taa_history").is_none());
+    assert_eq!(graph.segments().len(), 1, "{:?}", graph.segments());
+    assert!(frame.ids.taa.is_none());
+}
+
+/// A vendor resolve is told how much of each pixel the blended queues drew,
+/// from what each of the two composites present blended by, at the render
+/// extent and before the resolve reads it; a frame with neither queue, or
+/// one the engine resolves, draws no mask.
+#[test]
+fn the_reactive_mask_is_drawn_from_whichever_blended_queues_the_frame_has() {
+    use orrin_core::gfx::graph::{Access, Extent};
+    let frame = |transparency, refraction, vendor_resolve| {
+        declare(FrameConfig {
+            transparency,
+            refraction,
+            vendor_resolve,
+            ..upscaled_config(Upscaling::Quality)
+        })
+        .unwrap()
+    };
+    for (transparency, refraction) in [(true, false), (false, true), (true, true)] {
+        let frame = frame(transparency, refraction, true);
+        let graph = &frame.graph;
+        let slot = |name: &str| {
+            graph
+                .order()
+                .iter()
+                .position(|&pass| graph.pass_name(pass) == name)
+                .unwrap_or_else(|| panic!("the frame has no {name}"))
+        };
+        let mask = graph.order()[slot("reactive_mask")];
+        let mut declared: Vec<_> = graph
+            .accesses(mask)
+            .iter()
+            .map(|&(id, access)| (graph.resource_name(id), access))
+            .collect();
+        declared.sort_by_key(|&(name, _)| name);
+        let mut expected = vec![("reactive_mask", Access::ColorAttachment)];
+        if refraction {
+            expected.push(("refraction_accum", Access::Sampled));
+            assert!(slot("refraction_draw") < slot("reactive_mask"));
+        }
+        if transparency {
+            expected.push(("oit_reveal", Access::Sampled));
+            assert!(slot("oit_accumulate") < slot("reactive_mask"));
+        }
+        expected.sort_by_key(|&(name, _)| name);
+        assert_eq!(declared, expected, "{transparency} {refraction}");
+        let resolve = graph.order()[slot("taa_resolve")];
+        assert!(
+            graph
+                .accesses(resolve)
+                .iter()
+                .any(|&(id, access)| graph.resource_name(id) == "reactive_mask"
+                    && access == Access::Sampled)
+        );
+        assert_eq!(
+            image_desc(graph, "reactive_mask").map(|desc| (desc.extent, desc.format)),
+            Some((Extent::Render, orrin_core::gfx::format::Format::R8Unorm))
+        );
+    }
+    for frame in [frame(false, false, true), frame(true, true, false)] {
+        assert!(image_desc(&frame.graph, "reactive_mask").is_none());
+    }
+}
+
+/// The exposure a vendor resolve reads is last frame's, copied after that
+/// frame's metering into the other image of a pair: so the copy follows the
+/// metering, writes the image the resolve does not read, and leaves it in the
+/// layout the resolve reads it in next frame. A frame the engine resolves
+/// carries neither the copy nor the pair.
+#[test]
+fn a_vendor_resolve_reads_the_exposure_the_last_frame_copied_after_its_metering() {
+    use orrin_core::gfx::graph::{Access, Extent, ImageLayout};
+    let vendor = |on| {
+        declare(FrameConfig {
+            vendor_resolve: on,
+            async_compute: true,
+            ..upscaled_config(Upscaling::Quality)
+        })
+        .unwrap()
+    };
+    let frame = vendor(true);
+    let graph = &frame.graph;
+    let slot = |name: &str| {
+        graph
+            .order()
+            .iter()
+            .position(|&pass| graph.pass_name(pass) == name)
+            .unwrap_or_else(|| panic!("the frame has no {name}"))
+    };
+    let copy = graph.order()[slot("upscaler_exposure")];
+    let declared: Vec<_> = graph
+        .accesses(copy)
+        .iter()
+        .map(|&(id, access)| (graph.resource_name(id), access))
+        .collect();
+    assert_eq!(
+        declared,
+        [
+            ("exposure", Access::StorageRead),
+            ("upscaler_exposure", Access::StorageWrite),
+        ]
+    );
+    assert!(slot("luminance_average") < slot("upscaler_exposure"));
+    for name in ["upscaler_exposure", "upscaler_exposure_history"] {
+        assert!(
+            graph
+                .imported_images()
+                .any(|(id, desc)| graph.resource_name(id) == name
+                    && desc.extent == Extent::Fixed([1, 1])),
+            "{name} is a 1x1 import, carried across the frame boundary"
+        );
+    }
+    let closing: Vec<_> = graph
+        .final_barriers()
+        .iter()
+        .filter(|barrier| {
+            graph
+                .resource_name(barrier.resource)
+                .starts_with("upscaler_exposure")
+        })
+        .map(|barrier| (graph.resource_name(barrier.resource), barrier.new_layout))
+        .collect();
+    assert_eq!(
+        closing,
+        [("upscaler_exposure", ImageLayout::ShaderReadOnlyOptimal)],
+        "the written image ends the frame where the next one reads it, the read one where it began"
+    );
+
+    let engine = vendor(false);
+    let named = |name: &str| {
+        (0..engine.graph.order().len()).any(|slot| {
+            engine
+                .graph
+                .accesses(engine.graph.order()[slot])
+                .iter()
+                .any(|&(id, _)| engine.graph.resource_name(id).starts_with(name))
+        })
+    };
+    assert!(!named("upscaler_exposure"));
+    assert!(
+        !engine
+            .graph
+            .order()
+            .iter()
+            .any(|&pass| engine.graph.pass_name(pass) == "upscaler_exposure")
+    );
+}
+
+/// Upscaled, a render-extent and an output-extent image are different sizes,
+/// so none may share an allocation; at native they are one size, and the frame
+/// keeps the sharing it had. Both halves are what a wrong fold would break: the
+/// first as two images of different sizes in one block, the second as a native
+/// frame quietly needing more memory than it did.
+#[test]
+fn only_a_native_frame_shares_memory_across_the_two_extents() {
+    use orrin_core::gfx::graph::Extent;
+    let crosses = |upscaling| {
+        let graph = declare(upscaled_config(upscaling)).unwrap().graph;
+        graph.alias_groups().iter().any(|group| {
+            let output = |id| {
+                let desc = image_desc(&graph, graph.resource_name(id)).unwrap();
+                matches!(desc.extent, Extent::Output | Extent::OutputDiv(_))
+            };
+            group.iter().any(|&id| output(id)) && group.iter().any(|&id| !output(id))
+        })
+    };
+    assert!(crosses(Upscaling::Native));
+    for upscaling in [
+        Upscaling::Quality,
+        Upscaling::Balanced,
+        Upscaling::Performance,
+        Upscaling::UltraPerformance,
+    ] {
+        assert!(
+            !crosses(upscaling),
+            "{upscaling:?} shares memory across the extents"
+        );
     }
 }
 
@@ -2639,14 +3815,20 @@ fn everything_sharing_a_block_would_have_been_allocated_alike() {
                 .unwrap_or_else(|| panic!("{label}: an aliased resource is a transient image"))
                 .1
         };
+        // As the frame sizes them: a render-extent and an output-extent image
+        // are one size in a frame that does not upscale.
+        let sized = |desc: ImageDesc| ImageDesc {
+            extent: desc.extent.folded(graph.upscaled()),
+            ..desc
+        };
         for group in graph.alias_groups() {
             let first = image(group[0]);
             for &member in &group[1..] {
                 let member_image = image(member);
                 assert_eq!(
-                    (first.desc, first.usage, first.concurrent),
+                    (sized(first.desc), first.usage, first.concurrent),
                     (
-                        member_image.desc,
+                        sized(member_image.desc),
                         member_image.usage,
                         member_image.concurrent
                     ),

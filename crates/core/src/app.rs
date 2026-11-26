@@ -346,6 +346,8 @@ impl App {
         world.insert_resource(AmbientLight::default());
         world.insert_resource(SsaoSettings::default());
         world.insert_resource(SsrSettings::default());
+        world.insert_resource(crate::scene::RayTracingSettings::default());
+        world.insert_resource(crate::scene::GiSettings::default());
         world.insert_resource(SubsurfaceSettings::default());
         world.insert_resource(TransparencySettings::default());
         world.insert_resource(DecalSettings::default());
@@ -355,6 +357,7 @@ impl App {
         world.insert_resource(HdrSettings::default());
         world.insert_resource(BloomSettings::default());
         world.insert_resource(TaaSettings::default());
+        world.insert_resource(crate::scene::UpscalerStatus::default());
         world.insert_resource(MotionBlurSettings::default());
         world.insert_resource(DofSettings::default());
         world.insert_resource(FogSettings::default());
@@ -1216,6 +1219,12 @@ impl ApplicationHandler for App {
                 active
                     .renderer
                     .set_present(*self.world.resource::<PresentSettings>());
+                active
+                    .renderer
+                    .set_ray_tracing(*self.world.resource::<crate::scene::RayTracingSettings>());
+                active
+                    .renderer
+                    .set_gi(*self.world.resource::<crate::scene::GiSettings>());
 
                 if let Some(view) = active.editor.take_screenshot_request() {
                     active.renderer.request_screenshot(view);
@@ -1287,9 +1296,14 @@ impl ApplicationHandler for App {
 
                 let gpu_ms = renderer.gpu_frame_ms();
                 let (vram_used, vram_total) = renderer.gpu_memory();
-                self.world
-                    .resource_mut::<FrameStats>()
-                    .set_gpu_stats(gpu_ms, vram_used, vram_total);
+                let traced = renderer.traced_scene_bytes();
+                let mut stats = self.world.resource_mut::<FrameStats>();
+                stats.set_gpu_stats(gpu_ms, vram_used, vram_total);
+                stats.set_traced_scene_bytes(traced);
+                drop(stats);
+                // Its strings are shared, so this copies counts, not text.
+                *self.world.resource_mut::<crate::scene::UpscalerStatus>() =
+                    renderer.upscaler_status().clone();
 
                 // Expire debug lines now that this frame has drawn them: a
                 // one-frame line (expiry == its spawn time) is dropped, a timed
@@ -1458,7 +1472,9 @@ fn create_vulkan_instance(
     validate: bool,
 ) -> (Arc<Instance>, Option<DebugUtilsMessenger>) {
     let library = VulkanLibrary::new().expect("failed to load vulkan library");
-    let mut enabled_extensions = Surface::required_extensions(event_loop).unwrap();
+    let mut enabled_extensions = Surface::required_extensions(event_loop)
+        .unwrap()
+        .union(&crate::gfx::vulkan::upscaler_instance_extensions(&library));
 
     // Architecture §3.5: validation on in every dev build. Silently skipped
     // when the layer isn't installed, so a machine without the Vulkan SDK

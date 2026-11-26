@@ -13,6 +13,7 @@ use crate::gfx::{
 use crate::scene::{Camera, EnvironmentSettings};
 
 use super::cull::{Draws, Surface};
+use super::gi::GiViews;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::surface::{Surfaces, Twin};
 use super::swapchain::DEPTH_FORMAT;
@@ -206,7 +207,7 @@ fn gpu_point_lights(lighting: &SceneLighting, views: &ShadowViews, out: &mut Vec
                 let channels = f32::from_bits(light.channels);
                 match views.caster(LightKind::Point, index) {
                     Some(caster) => [caster.first_view as f32, caster.near, channels, 0.0],
-                    None => [-1.0, 0.0, channels, 0.0],
+                    None => [no_view(light.casts_shadows), 0.0, channels, 0.0],
                 }
             },
         });
@@ -214,6 +215,14 @@ fn gpu_point_lights(lighting: &SceneLighting, views: &ShadowViews, out: &mut Vec
     if out.is_empty() {
         out.push(GpuPointLight::ZERO);
     }
+}
+
+/// What a light with no shadow view carries in place of one. Both are "none"
+/// to a fragment, which has only the atlas to ask. A ray's hit traces its own
+/// shadow and so needs to know which lights cast none at all:
+/// `LIGHT_CASTS_NONE` in `lights.glsl` is the line between the two.
+fn no_view(casts_shadows: bool) -> f32 {
+    if casts_shadows { -1.0 } else { -2.0 }
 }
 
 /// [`gpu_point_lights`] for the spots.
@@ -227,7 +236,7 @@ fn gpu_spot_lights(lighting: &SceneLighting, views: &ShadowViews, out: &mut Vec<
     {
         let face = views
             .caster(LightKind::Spot, index)
-            .map_or([-1.0, 0.0], |caster| {
+            .map_or([no_view(light.casts_shadows), 0.0], |caster| {
                 [caster.first_view as f32, caster.near]
             });
         out.push(GpuSpotLight {
@@ -615,6 +624,8 @@ struct SurfaceSet {
     fog_volume: TextureViewId,
     fog_sampler: SamplerId,
     fog: BufferId,
+    gi: GiViews,
+    gathered: TextureViewId,
 }
 
 /// The views a frame binds when a term has nothing to say — white occlusion,
@@ -627,6 +638,8 @@ pub(super) struct NeutralViews {
     pub env_sampler: SamplerId,
     pub fog_volume: TextureViewId,
     pub fog_sampler: SamplerId,
+    pub gi: GiViews,
+    pub gathered: TextureViewId,
 }
 
 /// The blocks a frame binds when there is nothing to light with — no punctual
@@ -680,11 +693,25 @@ impl PreviewLighting {
 /// keeps that from being a comment somebody has to keep true.
 pub(super) struct ForwardSets {
     groups: [BindGroupId; 5],
+    lights: LightBlocks,
+}
+
+/// This frame's lighting block and its two light tables, for a pass that
+/// lights something through a layout of its own: a ray's hit.
+#[derive(Clone, Copy)]
+pub(super) struct LightBlocks {
+    pub lighting: BufferId,
+    pub points: BufferId,
+    pub spots: BufferId,
 }
 
 impl ForwardSets {
     pub(super) fn groups(&self) -> [BindGroupId; 5] {
         self.groups
+    }
+
+    pub(super) fn lights(&self) -> LightBlocks {
+        self.lights
     }
 
     /// The same five with the object set swapped, for a pass that indexes
@@ -697,7 +724,10 @@ impl ForwardSets {
     pub(super) fn with_object_set(&self, object_set: BindGroupId) -> ForwardSets {
         let mut groups = self.groups;
         groups[4] = object_set;
-        ForwardSets { groups }
+        ForwardSets {
+            groups,
+            lights: self.lights,
+        }
     }
 }
 
@@ -850,6 +880,10 @@ pub struct ForwardPass {
     /// data that two existing passes read, which is exactly what the shadow face
     /// table above is.
     sampler: SamplerId,
+    /// What the material textures are sampled through in a frame rendered
+    /// below its output's extent, and `None` at native. See
+    /// [`set_texture_sampler`](Self::set_texture_sampler).
+    biased: Option<SamplerId>,
     ao_sampler: SamplerId,
     light_scratch: std::sync::Mutex<LightScratch>,
 }
@@ -875,6 +909,7 @@ impl ForwardPass {
             compare: true,
             anisotropy: None,
             max_lod: None,
+            lod_bias: 0.0,
         });
         let samplers = [(SHADOW_SET as u32, SHADOW_SAMPLER_BINDING, shadow_sampler)];
         let pipeline = |colors: &[Format], fragment: ShaderId, cull_back: bool, samples| {
@@ -957,6 +992,7 @@ impl ForwardPass {
             compare: false,
             anisotropy: rhi.max_anisotropy(),
             max_lod: None,
+            lod_bias: 0.0,
         });
 
         let ao_sampler = rhi.create_sampler(SamplerDesc {
@@ -966,6 +1002,7 @@ impl ForwardPass {
             compare: false,
             anisotropy: None,
             max_lod: Some(1.0),
+            lod_bias: 0.0,
         });
 
         Self {
@@ -973,9 +1010,17 @@ impl ForwardPass {
             multisampled,
             single,
             sampler,
+            biased: None,
             ao_sampler,
             light_scratch: std::sync::Mutex::new(LightScratch::default()),
         }
+    }
+
+    /// Sample the material textures through `biased`, or through the
+    /// unbiased sampler with `None`. Takes effect on the texture set built
+    /// next, so the caller drops the one it has.
+    pub(super) fn set_texture_sampler(&mut self, biased: Option<SamplerId>) {
+        self.biased = biased;
     }
 
     /// The quartet a frame draws with, given whether it rasterises multisampled.
@@ -1077,7 +1122,7 @@ impl ForwardPass {
             self.single.plain,
             TEXTURE_SET as u32,
             textures,
-            self.sampler,
+            self.biased.unwrap_or(self.sampler),
         )
     }
 
@@ -1178,6 +1223,8 @@ impl ForwardPass {
         fog: BufferId,
         fog_volume: TextureViewId,
         fog_sampler: SamplerId,
+        gi: GiViews,
+        gathered: TextureViewId,
         surface_time: f32,
     ) -> ForwardSets {
         // Both halves fall back to the scene's flat ambient when nothing is
@@ -1257,6 +1304,8 @@ impl ForwardPass {
                 fog_volume,
                 fog_sampler,
                 fog,
+                gi,
+                gathered,
             },
             material_set,
             texture_set,
@@ -1276,6 +1325,11 @@ impl ForwardPass {
         texture_set: BindGroupId,
         object_set: BindGroupId,
     ) -> ForwardSets {
+        let lights = LightBlocks {
+            lighting: set0.lighting,
+            points: set0.points,
+            spots: set0.spots,
+        };
         let lighting_set = device.create_transient_bind_group(
             self.single.plain,
             0,
@@ -1324,6 +1378,7 @@ impl ForwardPass {
             binding,
             resource: BindingResource::Texture(view),
         };
+        let [gi_block, gi_probes, gi_irradiance, gi_distance, gi_sampler] = set3.gi.bindings(9);
         let ao_set = device.create_transient_bind_group(
             self.single.plain,
             3,
@@ -1356,11 +1411,22 @@ impl ForwardPass {
                     binding: 8,
                     resource: BindingResource::UniformBuffer(set3.fog),
                 },
+                // The irradiance volumes, or their inert stand-ins, for the
+                // reason the fog is bound either way.
+                gi_block,
+                gi_probes,
+                gi_irradiance,
+                gi_distance,
+                gi_sampler,
+                // The final gather's irradiance, or a stand-in the volumes'
+                // block says not to read.
+                texture(14, set3.gathered),
             ],
         );
 
         ForwardSets {
             groups: [lighting_set, material_set, texture_set, ao_set, object_set],
+            lights,
         }
     }
 
@@ -1436,6 +1502,8 @@ impl ForwardPass {
                 fog_volume: neutral.fog_volume,
                 fog_sampler: neutral.fog_sampler,
                 fog: blocks.fog,
+                gi: neutral.gi,
+                gathered: neutral.gathered,
             },
             material_set,
             texture_set,

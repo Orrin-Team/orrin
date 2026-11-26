@@ -1,4 +1,4 @@
-use super::{BufferId, PipelineId, SamplerId, ShaderModuleId, TextureViewId};
+use super::{BufferId, MeshSpan, PipelineId, SamplerId, ShaderModuleId, TextureViewId};
 use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::graph::{BufferUsage, ImageUsage};
 use crate::gfx::shaders::ShaderId;
@@ -73,6 +73,11 @@ pub struct SamplerDesc {
     pub anisotropy: Option<f32>,
     /// Upper end of the sampled mip range; `None` is unclamped.
     pub max_lod: Option<f32>,
+    /// Added to every level of detail the sampler computes, held to what the
+    /// device allows: negative samples finer mips. What a material sampled
+    /// at the render extent is given so it is as sharp as it would be at the
+    /// output's. Metal has no such state on a sampler, so there it is zero.
+    pub lod_bias: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -275,6 +280,24 @@ pub enum BindingResource {
     /// a `BufferId` because the driver owns the arena and replaces its buffers
     /// when they grow: each group resolves whichever one is current.
     Geometry(GeometryStream),
+    /// The scene's acceleration structure as this frame builds it, for a
+    /// shader that traces ray queries. Named for the reason the geometry is:
+    /// the driver owns it, and which one is current changes every frame.
+    SceneAccel,
+}
+
+/// One thing a ray can hit: a mesh, where it stands, and what a hit on it
+/// reports.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RayInstance {
+    pub span: MeshSpan,
+    /// Object to world, as the top three rows of the matrix.
+    pub transform: [[f32; 4]; 3],
+    /// What a shader reads back from a hit. Twenty-four bits.
+    pub id: u32,
+    /// Whether every triangle stops a ray outright. False for a cutout, whose
+    /// hits the tracing shader tests against the material's alpha itself.
+    pub opaque: bool,
 }
 
 /// Which of the shared geometry's buffers a [`BindingResource::Geometry`] is.
@@ -284,6 +307,8 @@ pub enum GeometryStream {
     Positions,
     /// `u32`s, relative to a mesh's `vertex_offset`.
     Indices,
+    /// `SurfaceVertex`es, beside the positions vertex for vertex.
+    Surfaces,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -346,6 +371,10 @@ pub enum Feature {
     CoverageTexture,
     /// Sampling block-compressed (BC5, BC7) textures.
     BlockCompression,
+    /// Tracing rays against the scene from a shader: acceleration structures
+    /// built on the device and ray queries against them. False on Metal until
+    /// that driver builds acceleration structures of its own.
+    RayTracing,
 }
 
 /// Which kind of buffer a per-frame block is bound as.

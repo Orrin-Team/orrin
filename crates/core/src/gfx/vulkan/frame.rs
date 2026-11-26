@@ -9,6 +9,15 @@
 //! Nothing computes an execution order, a layout, or a barrier by hand, which is
 //! what makes a new pass a registration in `declare` rather than surgery on a
 //! fixed pipeline.
+//!
+//! It is also where the frame's two extents are assigned. Everything up to and
+//! including what the temporal resolve reads is at the render extent — the
+//! geometry passes, every screen-space effect, the final gather and the fog's
+//! froxels, all of which read `gl_FragCoord` against a scene target or are read
+//! by one that does — and the resolve writes at the output extent, where the
+//! lens, the shutter, bloom, metering, the tonemap and everything the editor
+//! draws stay. A pass after the resolve that needs the prepass reads it under
+//! its own pixel rather than attaching it.
 
 use crate::gfx::format::Format;
 use crate::gfx::graph::ImageLayout;
@@ -22,7 +31,7 @@ use super::MSAA_SAMPLES;
 use super::bloom::MAX_BLOOM_MIPS;
 use super::contact_shadows::MASK_FORMAT;
 use super::dof::COC_TILE_SHIFT;
-use super::fog::{FOG_FORMAT, FROXEL_SHIFT, FROXEL_SLICES};
+use super::fog::{FOG_FORMAT, FROXEL_SHIFT, FROXEL_SLICES, LIGHT_SHIFT, LIGHT_STATE_FORMAT};
 use super::hdr::{HDR_FORMAT, HDR_WIDE_FORMAT};
 use super::motion_blur::TILE_SHIFT;
 use super::occlusion::{OCCLUSION_FORMAT, OCCLUSION_LEVELS};
@@ -35,6 +44,7 @@ use super::ssao::AO_FORMAT;
 use super::ssr::{HIZ_FORMAT, HIZ_LEVELS, RAY_FORMAT, SOURCE_LEVELS};
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
+use super::upscaler::{EXPOSURE_FORMAT, REACTIVE_FORMAT};
 use crate::gfx::shadow_views::atlas_extent;
 
 /// What a frame's structure depends on. A change to any of these recompiles the
@@ -205,6 +215,44 @@ pub struct FrameConfig {
     /// asks recompiles the graph twice, as one that redraws the material
     /// sphere does.
     pub screenshot: Option<ShotView>,
+    /// Whether the frame builds the acceleration structures a ray is traced
+    /// against: the device can, and something in the frame traces. Structural
+    /// because it registers the two builds, and those cost a frame that traces
+    /// nothing the same as one that does.
+    pub ray_tracing: bool,
+    /// Whether the traced scene is drawn in place of the frame. Needs
+    /// `ray_tracing`.
+    pub ray_debug: bool,
+    /// Whether the reflections trace the scene for what the screen cannot
+    /// answer. Needs `ray_tracing` and `ssr`.
+    pub ray_reflections: bool,
+    /// Whether the frame's colour is replaced by the path-traced reference.
+    /// Needs `ray_tracing`.
+    pub ray_path_trace: bool,
+    /// Probes along each side of an irradiance volume's cascade, zero where
+    /// the volumes are off. Live, they are four dispatches at the head of the
+    /// frame and every pass that lights a surface reads what they leave; a
+    /// size rather than a flag, because it is the atlases' extent. Needs
+    /// `ray_tracing`. Zero is the frame exactly as it was, lit by the
+    /// environment's diffuse series alone.
+    pub gi_probes: u32,
+    /// How far below the output's extent the scene is rendered. Structural
+    /// although the passes are the same, because it decides which images are
+    /// one size and so which may share an allocation, how the wireframe tests
+    /// its edges, and the resolve's history format. Needs `taa`.
+    pub upscaling: crate::scene::Upscaling,
+    /// Whether a vendor's upscaler resolves the frame in place of the
+    /// engine's own. The node keeps its place and its inputs; what changes is
+    /// its body, that it keeps no history of the engine's, and that the frame
+    /// stays on one queue. Needs `taa`.
+    pub vendor_resolve: bool,
+    /// How many times the final gather's resolution halves the frame's each
+    /// way, zero where it does not run. Live, it is five dispatches between
+    /// the prepass and the forward pass, and the forward pass reads what they
+    /// leave in place of the volumes; a shift rather than a flag, because it
+    /// is the extent of their images. Needs `gi_probes`, and keeps the prepass
+    /// alive on its own.
+    pub gi_gather: u32,
 }
 
 /// What a screenshot shows.
@@ -241,6 +289,9 @@ pub enum PassBody {
     SsaoBlur,
     /// The sun's visibility over the short range a cascade texel cannot resolve.
     ContactShadows,
+    /// The light the air scatters from everything but the sun, traced from the
+    /// air into the world radiance cache where the irradiance volumes are live.
+    FogLight,
     /// What every froxel of air scatters and blocks — one cascade lookup apiece,
     /// which is the whole cost of the effect and the whole reason a shaft has an
     /// edge.
@@ -282,6 +333,12 @@ pub enum PassBody {
     RefractionComposite,
     /// Reprojects the history onto this frame and accumulates into it.
     TaaResolve,
+    /// The same node's inputs and output, resolved by a vendor's upscaler,
+    /// which keeps its history itself.
+    VendorResolve,
+    /// How much of each pixel the blended queues drew over the opaque frame,
+    /// for a vendor's upscaler to trust its history less there.
+    ReactiveMask,
     /// Half the frame, carrying its own circle of confusion.
     DofPrefilter,
     /// The widest near and far circle per tile, which sizes the gather's kernel.
@@ -299,6 +356,9 @@ pub enum PassBody {
     MotionBlurGather,
     LuminanceHistogram,
     LuminanceAverage,
+    /// The exposure the tonemap applies, for a vendor's upscaler to read next
+    /// frame.
+    UpscalerExposure,
     /// Half the frame, exposed and firefly-weighted: the chain's first level.
     BloomPrefilter,
     /// Writes down-chain level `n`, reading level `n - 1`.
@@ -334,6 +394,36 @@ pub enum PassBody {
     /// it and derives its barriers.
     ScreenshotOverlay,
     Overlay,
+    /// The acceleration structures of meshes uploaded since the last frame
+    /// that built any, within the frame's budget, and their compaction.
+    RayMeshes,
+    /// The scene's acceleration structure, over this frame's instances.
+    RayScene,
+    /// The traced scene from one ray per pixel, over the tonemapped frame.
+    RayDebug,
+    /// One more path per pixel of the reference, and its running mean.
+    PathTrace,
+    /// Every ray of every probe of the grid this frame updates, each hit
+    /// filed in the world radiance cache.
+    GiTrace,
+    /// The cache's cells the rays used, listed for shading; the ones nothing
+    /// has used for long enough, emptied.
+    GiCacheCompact,
+    /// Each probe's tile brought up to date from its rays.
+    GiUpdate,
+    /// Each listed cell shaded once, for the probes' next update.
+    GiCacheShade,
+    /// One ray per texel of the final gather, kept as harmonics.
+    GiGather,
+    /// Those rays into each texel's running mean, reprojected.
+    GiGatherTemporal,
+    /// One axis of one level of the gather's spatial filter.
+    GiGatherBlur {
+        vertical: bool,
+        wide: bool,
+    },
+    /// The gather to the frame's resolution, for the forward pass.
+    GiGatherUpscale,
     /// The cached layers of the shadow views that redraw theirs this frame:
     /// the casters standing still, into an atlas kept from frame to frame.
     ShadowStatic,
@@ -360,6 +450,13 @@ pub struct FrameIds {
     /// frame it is in, which is what makes inserting a stage a change to one
     /// binding rather than to every consumer.
     pub scene_color: ResourceId,
+    /// What the exposure is metered from: the rasterised frame, which
+    /// `scene_color` is but where the path-traced reference stands in for it.
+    /// The reference is then exposed as the frame it is held against, so a
+    /// difference between them is one of light and not of exposure.
+    pub metered_color: ResourceId,
+    /// The reference's two images, where the frame draws it.
+    pub path: Option<PathIds>,
     /// The multisampled pair, in a frame that rasterises at more than one
     /// sample. `None` on the default path, where the forward pass shades
     /// straight into `hdr_color` and borrows the prepass depth.
@@ -392,6 +489,9 @@ pub struct FrameIds {
     pub transparency: Option<TransparencyIds>,
     pub refraction: Option<RefractionIds>,
     pub taa: Option<TaaIds>,
+    /// The resolve's images where a vendor's upscaler runs it, in place of
+    /// `taa`.
+    pub vendor_resolve: Option<VendorResolveIds>,
     pub dof: Option<DofIds>,
     pub motion_blur: Option<MotionBlurIds>,
     /// The shadow atlas, when anything casts: what the shading passes and the
@@ -403,11 +503,133 @@ pub struct FrameIds {
     /// mesh covers, green where the hovered one does. With the editor only.
     pub outline_mask: Option<ResourceId>,
     /// The wireframe's mode, and the depth it hides edges with when it has one.
-    pub wireframe: Option<(super::wireframe::Wireframe, Option<ResourceId>)>,
+    pub wireframe: Option<(super::wireframe::Wireframe, Option<EdgeDepth>)>,
     pub material_preview: Option<MaterialPreviewIds>,
     /// The screenshot's image, which the renderer owns for the one frame that
     /// draws it.
     pub screenshot: Option<ResourceId>,
+    /// What a ray is traced against, in a frame that traces.
+    pub ray: Option<RayIds>,
+    /// The irradiance volumes and the radiance cache, where they are live.
+    pub gi: Option<GiIds>,
+    /// The final gather's images, where it runs.
+    pub gather: Option<GatherIds>,
+}
+
+/// What hides the wireframe's covered edges over the shaded frame: the prepass
+/// depth, attached where it is at the extent the edges are drawn at, and
+/// sampled where it is at the render extent below the output's, since a pass
+/// cannot attach an image of another extent than its target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeDepth {
+    Attached(ResourceId),
+    Sampled(ResourceId),
+}
+
+impl EdgeDepth {
+    /// The access a pass drawing edges over the frame declares on it.
+    pub fn access(self) -> (ResourceId, Access) {
+        match self {
+            EdgeDepth::Attached(depth) => (depth, Access::DepthAttachmentRead),
+            EdgeDepth::Sampled(depth) => (depth, Access::Sampled),
+        }
+    }
+}
+
+/// The irradiance volumes and the world radiance cache: every one kept from
+/// frame to frame by the pass that owns it, so imported. See `vulkan::gi`.
+#[derive(Clone, Copy, Debug)]
+pub struct GiIds {
+    /// Every probe's octahedral tile of irradiance, and of the distance it
+    /// sees and its square: what every pass that lights a surface samples.
+    pub irradiance: ResourceId,
+    pub distance: ResourceId,
+    /// The same irradiance over the last few updates alone, which the cache's
+    /// shading reads for the light that bounced.
+    pub bounce: ResourceId,
+    /// The part of that which came by each update's brightest rays, over as
+    /// many updates as `irradiance`: only the update reads it.
+    pub outlier: ResourceId,
+    /// Each probe's offset, whether it is inside geometry, and the coordinate
+    /// it was last written for.
+    pub probes: ResourceId,
+    /// What each ray this frame traces met, and what each ray last frame
+    /// traced met, which this frame's update takes in.
+    pub rays: ResourceId,
+    pub rays_previous: ResourceId,
+    /// The cache's table, and the list of its cells to shade with the
+    /// dispatch that covers them.
+    pub cells: ResourceId,
+    pub list: ResourceId,
+    pub args: ResourceId,
+    /// Each cell's light as the update reads it — last frame's shading — and
+    /// as this frame's shading writes it. The two swap every frame, for the
+    /// reason the occlusion pyramids do: see [`OcclusionIds`].
+    pub radiance_history: ResourceId,
+    pub radiance: ResourceId,
+    /// The final gather's ray for each cell it asked to be shaded, where the
+    /// gather runs.
+    pub gather_hits: Option<ResourceId>,
+}
+
+impl GiIds {
+    /// Whether `id` is one of the buffers here, which a barrier covers with a
+    /// memory barrier rather than by name.
+    pub fn holds_buffer(&self, id: ResourceId) -> bool {
+        [
+            self.probes,
+            self.rays,
+            self.rays_previous,
+            self.cells,
+            self.list,
+            self.args,
+            self.radiance_history,
+            self.radiance,
+        ]
+        .contains(&id)
+            || self.gather_hits == Some(id)
+    }
+}
+
+/// The final gather's images. See `vulkan::gi_gather`.
+///
+/// The accumulation is **imported** and ping-ponged, for the reason the TAA
+/// history is: `accumulated` is this frame's allocation and next frame's
+/// `history`, so it leaves in the layout `history` enters in. Everything else
+/// is made and spent within the frame.
+#[derive(Clone, Copy, Debug)]
+pub struct GatherIds {
+    /// The rays as they came back: three layers of harmonics and a fourth
+    /// for how far they went.
+    pub raw: ResourceId,
+    pub history: ResourceId,
+    pub accumulated: ResourceId,
+    /// The spatial filter's two axes, and its second level's.
+    pub blurred_x: ResourceId,
+    pub blurred: ResourceId,
+    pub wide_x: ResourceId,
+    pub wide: ResourceId,
+    /// The harmonics at the frame's resolution: what the forward pass reads.
+    pub irradiance: ResourceId,
+}
+
+/// The path-traced reference: every path's radiance so far, which the pass
+/// that owns it keeps between frames, and their mean, which the frame shows.
+#[derive(Clone, Copy, Debug)]
+pub struct PathIds {
+    pub sum: ResourceId,
+    pub mean: ResourceId,
+}
+
+/// The two levels of what a ray is traced against, which the device owns.
+#[derive(Clone, Copy, Debug)]
+pub struct RayIds {
+    /// Every mesh's acceleration structure, as one resource: a frame builds
+    /// some of them and the scene's is built over all of them, so one barrier
+    /// orders the two however many there are.
+    pub meshes: ResourceId,
+    /// The scene's, which a tracing shader binds.
+    pub scene: ResourceId,
 }
 
 /// The inspector's material sphere: shaded into `hdr` against `depth`, then
@@ -482,6 +704,13 @@ pub struct PrepassIds {
 /// frame, and nothing wants last frame's integral.
 #[derive(Clone, Copy, Debug)]
 pub struct FogIds {
+    /// The light the air scatters from everything but the sun, traced, where
+    /// the irradiance volumes are live: imported and ping-ponged as `scatter`
+    /// is, for the same reason.
+    pub light: Option<ResourceId>,
+    /// How far each cell's rays disagree from one frame to the next, which
+    /// sets how long its light is averaged: ping-ponged with `light`.
+    pub light_state: Option<ResourceId>,
     /// `rgb` = scattered radiance per metre, `a` = extinction per metre.
     pub scatter: ResourceId,
     /// `rgb` = in-scattered radiance up to this slice, `a` = the transmittance
@@ -514,6 +743,9 @@ pub struct SsrIds {
     /// alpha.
     pub rays: ResourceId,
     pub output: ResourceId,
+    /// Whether the trace and the composite also trace the scene itself, which
+    /// is which pair of pipelines the executor binds.
+    pub traced: bool,
 }
 
 /// The forward pass's multisampled targets, declared only when `FrameConfig::msaa`
@@ -634,6 +866,26 @@ pub struct TaaIds {
     pub output: ResourceId,
 }
 
+/// What a vendor's upscaler reads and writes in the resolve's place.
+///
+/// No history: the upscaler keeps its own on the device, so the frame's
+/// output is an ordinary transient, written once and read by what follows.
+/// The exposure is the one thing carried across frames, a ping-ponged pair
+/// imported for the reason [`TaaIds`] is.
+#[derive(Clone, Copy, Debug)]
+pub struct VendorResolveIds {
+    /// What [`TaaIds::source`] would be.
+    pub source: ResourceId,
+    pub output: ResourceId,
+    /// Last frame's exposure, which the resolve reads.
+    pub exposure_history: ResourceId,
+    /// This frame's, written after the metering: next frame's history.
+    pub exposure: ResourceId,
+    /// How much of each pixel the blended queues drew, where the frame has
+    /// either.
+    pub reactive: Option<ResourceId>,
+}
+
 /// Depth of field's three images, and what it was handed.
 ///
 /// `source` is recorded rather than re-derived because this pass sits in a
@@ -683,6 +935,19 @@ fn indirect(pass: PassBuilder<'_>, commands: ResourceId) -> PassBuilder<'_> {
     pass.access(commands, Access::IndirectRead)
 }
 
+/// Declares what a pass that lights a surface reads of the irradiance
+/// volumes, where they are live: one function for every such pass, so none
+/// can read them without being ordered after their update.
+fn reads_gi(pass: PassBuilder<'_>, gi: Option<GiIds>) -> PassBuilder<'_> {
+    match gi {
+        Some(ids) => pass
+            .access(ids.irradiance, Access::Sampled)
+            .access(ids.distance, Access::Sampled)
+            .access(ids.probes, Access::StorageRead),
+        None => pass,
+    }
+}
+
 /// What a shadow atlas is: one image every view is a tile of, its pages side
 /// by side.
 pub fn shadow_atlas_desc(resolution: u32) -> ImageDesc {
@@ -691,7 +956,24 @@ pub fn shadow_atlas_desc(resolution: u32) -> ImageDesc {
 
 pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let mut builder = GraphBuilder::new();
-    if config.async_compute {
+    let upscaled = config.upscaling != crate::scene::Upscaling::Native;
+    if upscaled {
+        assert!(config.taa, "upscaling is the temporal resolve's to do");
+        builder.upscale();
+    }
+    // A pass that shades a ray's hit reads the scene itself: every material's
+    // textures, the shared geometry, the material table. Those belong to the
+    // graphics queue's family alone — the images the two queues share are the
+    // frame's own, which is what the compiler can name and make concurrent —
+    // so a frame with such a pass among its dispatches is not split, or its
+    // tail would read them from a family that does not own them.
+    let shades_hits = config.ray_reflections || config.ray_path_trace || config.gi_probes > 0;
+    let gathers = config.ray_tracing && config.gi_probes > 0 && config.gi_gather > 0;
+    // Nor is a frame a vendor resolves: the upscaler's own images are made
+    // exclusive to whichever family first runs it, and the resolve sits in the
+    // compute tail, which would move it between families as the frame's shape
+    // changed.
+    if config.async_compute && !shades_hits && !config.vendor_resolve {
         builder.request_async_compute();
     }
     let mut bodies = Vec::new();
@@ -737,7 +1019,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let history = builder.import_image(
             "occlusion_history",
             ImageDesc::new(OCCLUSION_FORMAT)
-                .extent(Extent::FrameDiv(1))
+                .extent(Extent::RenderDiv(1))
                 .mip_levels(OCCLUSION_LEVELS),
             ImageLayout::ShaderReadOnlyOptimal,
             ImageLayout::ShaderReadOnlyOptimal,
@@ -747,7 +1029,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let hiz = builder.import_image(
             "occlusion_hiz",
             ImageDesc::new(OCCLUSION_FORMAT)
-                .extent(Extent::FrameDiv(1))
+                .extent(Extent::RenderDiv(1))
                 .mip_levels(OCCLUSION_LEVELS),
             ImageLayout::Undefined,
             ImageLayout::ShaderReadOnlyOptimal,
@@ -793,9 +1075,152 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         draw_commands
     };
 
+    // At the head of the frame, so anything after may trace. Two nodes and
+    // not one for the reason the cull is two: the scene's structure is built
+    // over the meshes', some of which this frame built, and the barrier between
+    // a build and a read of what it built is the compiler's to derive.
+    let ray = config.ray_tracing.then(|| {
+        let meshes = builder.import_acceleration_structure("ray_meshes");
+        let scene = builder.import_acceleration_structure("ray_scene");
+
+        let id = builder
+            .pass("ray_meshes", PassKind::Compute)
+            .access(meshes, Access::AccelerationStructureBuild)
+            .build();
+        record(id, PassBody::RayMeshes, &mut bodies);
+
+        let id = builder
+            .pass("ray_scene", PassKind::Compute)
+            .access(meshes, Access::AccelerationStructureInput)
+            .access(scene, Access::AccelerationStructureBuild)
+            .build();
+        record(id, PassBody::RayScene, &mut bodies);
+
+        RayIds { meshes, scene }
+    });
+
+    // Right behind the scene's build, because nothing here reads anything the
+    // frame rasterises: the volumes are the world's, not the view's, and every
+    // pass that lights a surface reads them. Four nodes for four steps that
+    // each need the last finished on the device: the probes, the rays, the
+    // cache's list of what they hit, and those cells shaded.
+    //
+    // The order the cache imposes is the one place this frame reads before it
+    // writes. The shading reads the volumes, for the light that bounced, and
+    // the update writes them; the update reads the cache's light, and the
+    // shading writes it. The update reads it for every cell its rays landed in
+    // shaded, so it takes in last frame's rays, from the half of the pair last
+    // frame's shading wrote, and runs first — the cycle the occlusion pyramids
+    // break the same way, with the rays as a pair as well.
+    let gi = ray.filter(|_| config.gi_probes > 0).map(|ray| {
+        let atlas = || {
+            ImageDesc::new(super::gi::ATLAS_FORMAT).extent(Extent::Fixed(
+                crate::gfx::probes::atlas_extent(config.gi_probes),
+            ))
+        };
+        // Entered and left sampled, for the reason every history is: the
+        // update reads each texel it writes, and everything after samples.
+        let irradiance = builder.import_image(
+            "gi_irradiance",
+            atlas(),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let distance = builder.import_image(
+            "gi_distance",
+            atlas(),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let bounce = builder.import_image(
+            "gi_bounce",
+            atlas(),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let outlier = builder.import_image(
+            "gi_outlier",
+            atlas(),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let ids = GiIds {
+            irradiance,
+            distance,
+            bounce,
+            outlier,
+            probes: builder.import_buffer("gi_probes"),
+            rays: builder.import_buffer("gi_rays"),
+            rays_previous: builder.import_buffer("gi_rays_previous"),
+            cells: builder.import_buffer("gi_cells"),
+            list: builder.import_buffer("gi_list"),
+            args: builder.import_buffer("gi_args"),
+            radiance_history: builder.import_buffer("gi_radiance_history"),
+            radiance: builder.import_buffer("gi_radiance"),
+            gather_hits: gathers.then(|| builder.import_buffer("gi_gather_hits")),
+        };
+
+        let id = builder
+            .pass("gi_update", PassKind::Compute)
+            .access(ids.probes, Access::StorageWrite)
+            .access(ids.rays_previous, Access::StorageRead)
+            .access(ids.radiance_history, Access::StorageRead)
+            .access(irradiance, Access::StorageWrite)
+            .access(distance, Access::StorageWrite)
+            .access(bounce, Access::StorageWrite)
+            .access(outlier, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiUpdate, &mut bodies);
+
+        // The list and its dispatch are emptied here, ahead of the pass that
+        // fills them.
+        let id = builder
+            .pass("gi_trace", PassKind::Compute)
+            .access(ray.scene, Access::AccelerationStructureRead)
+            .access(ids.probes, Access::StorageRead)
+            .access(ids.rays, Access::StorageWrite)
+            .access(ids.cells, Access::StorageWrite)
+            .access(ids.list, Access::StorageWrite)
+            .access(ids.args, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiTrace, &mut bodies);
+
+        let id = builder
+            .pass("gi_cache_compact", PassKind::Compute)
+            .access(ids.cells, Access::StorageWrite)
+            .access(ids.radiance_history, Access::StorageRead)
+            .access(ids.radiance, Access::StorageWrite)
+            .access(ids.list, Access::StorageWrite)
+            .access(ids.args, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiCacheCompact, &mut bodies);
+
+        let mut shade = builder
+            .pass("gi_cache_shade", PassKind::Compute)
+            .access(ray.scene, Access::AccelerationStructureRead)
+            .access(ids.args, Access::IndirectRead)
+            .access(ids.list, Access::StorageRead)
+            .access(ids.cells, Access::StorageWrite)
+            .access(ids.rays, Access::StorageRead)
+            .access(ids.probes, Access::StorageRead)
+            .access(bounce, Access::Sampled)
+            .access(distance, Access::Sampled)
+            .access(ids.radiance, Access::StorageWrite);
+        // Last frame's gather rays, read for the cells they asked for and
+        // declared written, for the reason the trace declares the probes'
+        // state: the gather writes this frame's after, and a read would be
+        // ordered after every write.
+        if let Some(hits) = ids.gather_hits {
+            shade = shade.access(hits, Access::StorageWrite);
+        }
+        record(shade.build(), PassBody::GiCacheShade, &mut bodies);
+
+        ids
+    });
+
     let swapchain_color = builder.import_image(
         "swapchain_color",
-        ImageDesc::new(config.color_format),
+        ImageDesc::new(config.color_format).extent(Extent::Output),
         // An acquired image's contents are not ours to keep, and the
         // presentation engine wants it back in `PresentSrc` — or, offscreen,
         // the readback wants it in the layout it copies from.
@@ -913,6 +1338,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         || config.transparency
         || config.refraction
         || config.occlusion_culling
+        || gathers
         // What the wireframe hides covered edges with.
         || (config.overlay && config.wireframe == Some(super::wireframe::Wireframe::OverShaded)))
     .then(|| PrepassIds {
@@ -927,9 +1353,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // screen UV through a linear sampler, so the only pass that has to know
     // which extent this is is the one setting the viewport.
     let ao_extent = if config.ssao_half_res {
-        Extent::FrameDiv(1)
+        Extent::RenderDiv(1)
     } else {
-        Extent::Frame
+        Extent::Render
     };
     let ssao = config.ssao.then(|| SsaoIds {
         raw_ao: builder.create_image("ssao_raw_ao", ImageDesc::new(AO_FORMAT).extent(ao_extent)),
@@ -1035,6 +1461,163 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         mask
     });
 
+    // Between the prepass and shading, where SSAO is, and for its reasons: it
+    // reads the prepass and nothing the forward pass draws, and the forward
+    // pass reads what it leaves by pixel. After the volumes and the cache's
+    // shading, whose light its rays read and whose cells they claim.
+    let gather = gi.filter(|_| gathers).map(|gi| {
+        use super::gi_gather::{GATHER_FORMAT, HISTORY_LAYERS, META_LAYERS, SH_LAYERS};
+        let prepass = prepass.expect("the final gather reads the geometry prepass");
+        let ray = ray.expect("the final gather traces");
+        let hits = gi.gather_hits.expect("declared with the volumes");
+        let low = |layers| {
+            ImageDesc::new(GATHER_FORMAT)
+                .extent(Extent::RenderDiv(config.gi_gather))
+                .array_layers(layers)
+        };
+        let raw = builder.create_image("gi_gather_raw", low(META_LAYERS));
+        // Entered and left sampled, for the reason every history is; and the
+        // allocation `accumulated` names this frame is `history` next frame,
+        // so it leaves where `history` enters. Entered `Undefined` because
+        // every texel is written.
+        let history = builder.import_image(
+            "gi_gather_history",
+            low(HISTORY_LAYERS),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let accumulated = builder.import_image(
+            "gi_gather_accumulated",
+            low(HISTORY_LAYERS),
+            ImageLayout::Undefined,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let blurred_x = builder.create_image("gi_gather_blur_x", low(SH_LAYERS));
+        let blurred = builder.create_image("gi_gather_blur_y", low(SH_LAYERS));
+        let wide_x = builder.create_image("gi_gather_blur_wide_x", low(SH_LAYERS));
+        let wide = builder.create_image("gi_gather_blur_wide_y", low(SH_LAYERS));
+        let irradiance = builder.create_image(
+            "gi_gather_irradiance",
+            ImageDesc::new(GATHER_FORMAT).array_layers(SH_LAYERS),
+        );
+
+        // The cache's cells are written: a cell a ray lands in is claimed.
+        let pass = builder
+            .pass("gi_gather", PassKind::Compute)
+            .access(ray.scene, Access::AccelerationStructureRead)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled);
+        let id = reads_gi(pass, Some(gi))
+            .access(gi.cells, Access::StorageWrite)
+            .access(gi.radiance, Access::StorageRead)
+            .access(hits, Access::StorageWrite)
+            .access(raw, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiGather, &mut bodies);
+
+        let id = builder
+            .pass("gi_gather_temporal", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(prepass.velocity, Access::Sampled)
+            .access(raw, Access::Sampled)
+            .access(history, Access::Sampled)
+            .access(accumulated, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiGatherTemporal, &mut bodies);
+
+        // Two images and not one, for the reason the subsurface blur has two:
+        // a pass that read and wrote one would be a cycle.
+        let id = builder
+            .pass("gi_gather_blur_x", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(accumulated, Access::Sampled)
+            .access(blurred_x, Access::StorageWrite)
+            .build();
+        record(
+            id,
+            PassBody::GiGatherBlur {
+                vertical: false,
+                wide: false,
+            },
+            &mut bodies,
+        );
+
+        let id = builder
+            .pass("gi_gather_blur_y", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(blurred_x, Access::Sampled)
+            .access(accumulated, Access::Sampled)
+            .access(blurred, Access::StorageWrite)
+            .build();
+        record(
+            id,
+            PassBody::GiGatherBlur {
+                vertical: true,
+                wide: false,
+            },
+            &mut bodies,
+        );
+
+        // The second level, into two images more: neither outlives the first
+        // level's, so each takes the other's allocation.
+        let id = builder
+            .pass("gi_gather_blur_wide_x", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(blurred, Access::Sampled)
+            .access(accumulated, Access::Sampled)
+            .access(wide_x, Access::StorageWrite)
+            .build();
+        record(
+            id,
+            PassBody::GiGatherBlur {
+                vertical: false,
+                wide: true,
+            },
+            &mut bodies,
+        );
+
+        let id = builder
+            .pass("gi_gather_blur_wide_y", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(wide_x, Access::Sampled)
+            .access(accumulated, Access::Sampled)
+            .access(wide, Access::StorageWrite)
+            .build();
+        record(
+            id,
+            PassBody::GiGatherBlur {
+                vertical: true,
+                wide: true,
+            },
+            &mut bodies,
+        );
+
+        let id = builder
+            .pass("gi_gather_upscale", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(wide, Access::Sampled)
+            .access(irradiance, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiGatherUpscale, &mut bodies);
+
+        GatherIds {
+            raw,
+            history,
+            accumulated,
+            blurred_x,
+            blurred,
+            wide_x,
+            wide,
+            irradiance,
+        }
+    });
+
     // After the cascades, because it reads them, and before every geometry pass,
     // because all three sample the result. It needs no prepass and takes no
     // screen-space input at all — a froxel is a point in the world, not a pixel —
@@ -1050,7 +1633,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let scatter = builder.import_image(
             "fog_scatter",
             ImageDesc::new(FOG_FORMAT)
-                .extent(Extent::FrameDiv(FROXEL_SHIFT))
+                .extent(Extent::RenderDiv(FROXEL_SHIFT))
                 .depth(FROXEL_SLICES),
             ImageLayout::ShaderReadOnlyOptimal,
             ImageLayout::ShaderReadOnlyOptimal,
@@ -1058,9 +1641,44 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let volume = builder.create_image(
             "fog_volume",
             ImageDesc::new(FOG_FORMAT)
-                .extent(Extent::FrameDiv(FROXEL_SHIFT))
+                .extent(Extent::RenderDiv(FROXEL_SHIFT))
                 .depth(FROXEL_SLICES),
         );
+
+        // The light the air scatters from everything round it, traced where
+        // the volumes are live: after the cache's shading and the gather's
+        // claims, whose cells its rays read, and with the volumes beside it for
+        // a ray that lands where the cache has no light yet.
+        let traced = ray.zip(gi).map(|(ray, gi)| {
+            let light = builder.import_image(
+                "fog_light",
+                ImageDesc::new(FOG_FORMAT)
+                    .extent(Extent::RenderDiv(FROXEL_SHIFT + LIGHT_SHIFT))
+                    .depth(FROXEL_SLICES >> LIGHT_SHIFT),
+                ImageLayout::ShaderReadOnlyOptimal,
+                ImageLayout::ShaderReadOnlyOptimal,
+            );
+            let state = builder.import_image(
+                "fog_light_state",
+                ImageDesc::new(LIGHT_STATE_FORMAT)
+                    .extent(Extent::RenderDiv(FROXEL_SHIFT + LIGHT_SHIFT))
+                    .depth(FROXEL_SLICES >> LIGHT_SHIFT),
+                ImageLayout::ShaderReadOnlyOptimal,
+                ImageLayout::ShaderReadOnlyOptimal,
+            );
+            let pass = builder
+                .pass("fog_light", PassKind::Compute)
+                .access(ray.scene, Access::AccelerationStructureRead)
+                .access(gi.cells, Access::StorageRead)
+                .access(gi.radiance, Access::StorageRead);
+            let id = reads_gi(pass, Some(gi))
+                .access(light, Access::StorageWrite)
+                .access(state, Access::StorageWrite)
+                .build();
+            record(id, PassBody::FogLight, &mut bodies);
+            (light, state)
+        });
+        let light = traced.map(|(light, _)| light);
 
         // The history is the *other* allocation of `scatter`, which the graph
         // cannot see and does not need to: the executor binds it, and a resource
@@ -1068,6 +1686,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let mut scatter_pass = builder.pass("fog_scatter", PassKind::Compute);
         if let Some(atlas) = shadow_atlas {
             scatter_pass = scatter_pass.access(atlas, Access::Sampled);
+        }
+        if let Some(light) = light {
+            scatter_pass = scatter_pass.access(light, Access::Sampled);
         }
         let id = scatter_pass.access(scatter, Access::StorageWrite).build();
         record(id, PassBody::FogScatter, &mut bodies);
@@ -1079,7 +1700,12 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .build();
         record(id, PassBody::FogIntegrate, &mut bodies);
 
-        FogIds { scatter, volume }
+        FogIds {
+            light,
+            light_state: traced.map(|(_, state)| state),
+            scatter,
+            volume,
+        }
     });
 
     // Declared before the pass that writes them, because the forward pass has to
@@ -1115,6 +1741,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     }
     if let Some(fog) = fog {
         forward = forward.access(fog.volume, Access::Sampled);
+    }
+    forward = reads_gi(forward, gi);
+    if let Some(gather) = gather {
+        forward = forward.access(gather.irradiance, Access::Sampled);
     }
     forward = match msaa {
         Some(msaa) => forward
@@ -1219,7 +1849,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let hiz = builder.create_image(
             "ssr_hiz",
             ImageDesc::new(HIZ_FORMAT)
-                .extent(Extent::FrameDiv(1))
+                .extent(Extent::RenderDiv(1))
                 .mip_levels(HIZ_LEVELS),
         );
         // The same shape over the lit frame, and what a rough reflection is
@@ -1229,7 +1859,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let source_pyramid = builder.create_image(
             "ssr_source",
             ImageDesc::new(HDR_FORMAT)
-                .extent(Extent::FrameDiv(1))
+                .extent(Extent::RenderDiv(1))
                 .mip_levels(SOURCE_LEVELS),
         );
         // Half the frame, for the reason depth of field's gather is: the cost is
@@ -1239,7 +1869,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // composite — which is why that pass reads the pyramids too.
         let rays = builder.create_image(
             "ssr_rays",
-            ImageDesc::new(RAY_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(RAY_FORMAT).extent(Extent::RenderDiv(1)),
         );
         let output = builder.create_image("ssr_color", ImageDesc::new(HDR_FORMAT));
 
@@ -1257,7 +1887,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .build();
         record(id, PassBody::SsrSource, &mut bodies);
 
-        let id = builder
+        // Both passes that trace a reflection fall back to the scene's
+        // structure where the screen has no answer, so both wait on its build.
+        let traced = ray.filter(|_| config.ray_reflections);
+        let mut trace = builder
             .pass("ssr_trace", PassKind::Compute)
             .access(hiz, Access::Sampled)
             .access(prepass.depth, Access::Sampled)
@@ -1265,9 +1898,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(prepass.material, Access::Sampled)
             .access(source_pyramid, Access::Sampled)
             .access(source, Access::Sampled)
-            .access(rays, Access::StorageWrite)
-            .build();
-        record(id, PassBody::SsrTrace, &mut bodies);
+            .access(rays, Access::StorageWrite);
+        if let Some(ray) = traced {
+            // A hit's bounce light is the volumes'.
+            trace = reads_gi(
+                trace.access(ray.scene, Access::AccelerationStructureRead),
+                gi,
+            );
+        }
+        record(trace.build(), PassBody::SsrTrace, &mut bodies);
 
         // The gather and the composite in one pass: what the gather makes for a
         // pixel is read by that pixel alone, so handing it over through a
@@ -1278,7 +1917,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // pass that both read and wrote the frame's colour would make "readers
         // after all writers" point in two directions and `compile` would report
         // a cycle.
-        let id = builder
+        let mut resolve = builder
             .pass("ssr_resolve", PassKind::Compute)
             .access(source, Access::Sampled)
             .access(rays, Access::Sampled)
@@ -1287,9 +1926,13 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(prepass.material, Access::Sampled)
             .access(hiz, Access::Sampled)
             .access(source_pyramid, Access::Sampled)
-            .access(output, Access::StorageWrite)
-            .build();
-        record(id, PassBody::SsrResolve, &mut bodies);
+            .access(output, Access::StorageWrite);
+        if let Some(ray) = traced {
+            resolve = resolve.access(ray.scene, Access::AccelerationStructureRead);
+        }
+        // What the environment's reflection it takes back was scaled by.
+        resolve = reads_gi(resolve, gi);
+        record(resolve.build(), PassBody::SsrResolve, &mut bodies);
 
         SsrIds {
             source,
@@ -1297,6 +1940,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             source_pyramid,
             rays,
             output,
+            traced: traced.is_some(),
         }
     });
 
@@ -1351,6 +1995,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         if let Some(fog) = fog {
             accumulate = accumulate.access(fog.volume, Access::Sampled);
         }
+        accumulate = reads_gi(accumulate, gi);
         let id = accumulate
             .access(accum, Access::ColorAttachment)
             .access(reveal, Access::ColorAttachment)
@@ -1404,7 +2049,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let scene = builder.create_image(
             "refraction_scene",
             ImageDesc::new(HDR_FORMAT)
-                .extent(Extent::FrameDiv(1))
+                .extent(Extent::RenderDiv(1))
                 .mip_levels(SCENE_LEVELS),
         );
         let accum =
@@ -1444,6 +2089,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         if let Some(fog) = fog {
             draw = draw.access(fog.volume, Access::Sampled);
         }
+        draw = reads_gi(draw, gi);
         let id = draw
             .access(accum, Access::ColorAttachment)
             .access(prepass.depth, Access::DepthAttachmentRead)
@@ -1474,16 +2120,78 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         shaded = refraction.output;
     }
 
-    let taa = config.taa.then(|| {
+    let vendor_resolve = (config.taa && config.vendor_resolve).then(|| {
+        let prepass = prepass.expect("the resolve reads the geometry prepass");
+        let output = builder.create_image(
+            "taa_color",
+            ImageDesc::new(HDR_FORMAT).extent(Extent::Output),
+        );
+        // Entered and left sampled, as `taa_history` is, and its writer's twin
+        // entered `Undefined` and left where this one is read: one texel, all
+        // of it written.
+        let exposure_desc = ImageDesc::new(EXPOSURE_FORMAT).extent(Extent::Fixed([1, 1]));
+        let exposure_history = builder.import_image(
+            "upscaler_exposure_history",
+            exposure_desc,
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let exposure = builder.import_image(
+            "upscaler_exposure",
+            exposure_desc,
+            ImageLayout::Undefined,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        // From what the two composites blended by, which they leave behind
+        // them; neither writes depth or motion, which is what makes their
+        // pixels ghost through a history.
+        let reactive = (transparency.is_some() || refraction.is_some()).then(|| {
+            let mask = builder.create_image("reactive_mask", ImageDesc::new(REACTIVE_FORMAT));
+            let mut pass = builder.pass("reactive_mask", PassKind::Inline);
+            if let Some(transparency) = transparency {
+                pass = pass.access(transparency.reveal, Access::Sampled);
+            }
+            if let Some(refraction) = refraction {
+                pass = pass.access(refraction.accum, Access::Sampled);
+            }
+            let id = pass.access(mask, Access::ColorAttachment).build();
+            record(id, PassBody::ReactiveMask, &mut bodies);
+            mask
+        });
+        // The states the upscaler is handed say these layouts, and it puts
+        // each image back in them before it returns.
+        let mut resolve = builder
+            .pass("taa_resolve", PassKind::Compute)
+            .access(shaded, Access::Sampled)
+            .access(prepass.velocity, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
+            .access(exposure_history, Access::Sampled);
+        if let Some(mask) = reactive {
+            resolve = resolve.access(mask, Access::Sampled);
+        }
+        let id = resolve.access(output, Access::StorageWrite).build();
+        record(id, PassBody::VendorResolve, &mut bodies);
+
+        VendorResolveIds {
+            source: shaded,
+            output,
+            exposure_history,
+            exposure,
+            reactive,
+        }
+    });
+
+    let taa = (config.taa && !config.vendor_resolve).then(|| {
         let prepass = prepass.expect("TAA reads the geometry prepass");
         // Entry `ShaderReadOnlyOptimal` states the steady state, which the
         // ping-pong guarantees: `output` below leaves every frame in exactly
         // that layout, and it is the allocation `history` names next frame. On
         // the first frame after an allocation the layout is still true — the
         // allocation put it there — and its contents are what `reset` ignores.
+        let format = super::taa::history_format(config.upscaling);
         let history = builder.import_image(
             "taa_history",
-            ImageDesc::new(HDR_FORMAT),
+            ImageDesc::new(format).extent(Extent::Output),
             ImageLayout::ShaderReadOnlyOptimal,
             ImageLayout::ShaderReadOnlyOptimal,
         );
@@ -1491,7 +2199,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // next frame wants to find it.
         let output = builder.import_image(
             "taa_color",
-            ImageDesc::new(HDR_FORMAT),
+            ImageDesc::new(format).extent(Extent::Output),
             ImageLayout::Undefined,
             ImageLayout::ShaderReadOnlyOptimal,
         );
@@ -1517,7 +2225,11 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // the resolve is a change to one binding rather than to every consumer.
     // Each optical stage below rebinds it in turn, which is what makes the
     // chain's order a property of this function alone.
-    let mut scene_color = taa.map_or(shaded, |taa| taa.output);
+    let mut scene_color = match (taa, vendor_resolve) {
+        (Some(taa), _) => taa.output,
+        (None, Some(vendor)) => vendor.output,
+        (None, None) => shaded,
+    };
 
     // Lens before shutter before sensor, which is the order light actually
     // meets them and the order Unity and Unreal both settled on. Defocus first,
@@ -1542,15 +2254,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // survives a format with no alpha and no negatives.
         let prefiltered = builder.create_image(
             "dof_prefiltered",
-            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::OutputDiv(1)),
         );
         let near = builder.create_image(
             "dof_near",
-            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::OutputDiv(1)),
         );
         let far = builder.create_image(
             "dof_far",
-            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::OutputDiv(1)),
         );
         // Two channels of maxima, for the reason the motion blur tiles are:
         // `R16G16_SFLOAT` is only a guaranteed storage format behind an optional
@@ -1558,9 +2270,12 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // a feature flag.
         let tile = builder.create_image(
             "dof_tile",
-            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(COC_TILE_SHIFT)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::OutputDiv(COC_TILE_SHIFT)),
         );
-        let output = builder.create_image("dof_color", ImageDesc::new(HDR_FORMAT));
+        let output = builder.create_image(
+            "dof_color",
+            ImageDesc::new(HDR_FORMAT).extent(Extent::Output),
+        );
 
         let id = builder
             .pass("dof_prefilter", PassKind::Compute)
@@ -1637,13 +2352,16 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // flag on the device.
         let tile = builder.create_image(
             "motion_blur_tile",
-            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::OutputDiv(TILE_SHIFT)),
         );
         let neighbour = builder.create_image(
             "motion_blur_neighbour",
-            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::OutputDiv(TILE_SHIFT)),
         );
-        let output = builder.create_image("motion_blur_color", ImageDesc::new(HDR_FORMAT));
+        let output = builder.create_image(
+            "motion_blur_color",
+            ImageDesc::new(HDR_FORMAT).extent(Extent::Output),
+        );
 
         // Depth as well as velocity, because where nothing was rasterised the
         // prepass wrote no motion and the sky still sweeps when the camera
@@ -1685,6 +2403,40 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         scene_color = motion_blur.output;
     }
 
+    // The reference, where it is asked for, in place of everything above: the
+    // frame from here on tonemaps the mean of its paths. It declares the frame
+    // it replaces as read, though it reads none of it, so the frame's structure
+    // is the same with the reference on as off — every pass still runs, and no
+    // history is dropped for having looked at the reference — and so the
+    // exposure it is shown at is metered from the frame it is held against.
+    let metered_color = scene_color;
+    let path = ray.filter(|_| config.ray_path_trace).map(|ray| {
+        // Kept between frames, so imported, and entered and left sampled for
+        // the reason every history is. See `occlusion_history`.
+        let sum = builder.import_image(
+            "path_sum",
+            ImageDesc::new(Format::Rgba32Float).extent(Extent::Output),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let mean = builder.create_image(
+            "path_mean",
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::Output),
+        );
+        let id = builder
+            .pass("path_trace", PassKind::Compute)
+            .access(ray.scene, Access::AccelerationStructureRead)
+            .access(scene_color, Access::Sampled)
+            .access(sum, Access::StorageWrite)
+            .access(mean, Access::StorageWrite)
+            .build();
+        record(id, PassBody::PathTrace, &mut bodies);
+        PathIds { sum, mean }
+    });
+    if let Some(path) = path {
+        scene_color = path.mean;
+    }
+
     // Imported, not created: temporal adaptation is a value that has to outlive
     // the frame, and a transient is `Undefined` at every frame's start by
     // contract. The exposure module owns the allocation; the graph only orders
@@ -1696,7 +2448,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
 
         let id = builder
             .pass("luminance_histogram", PassKind::Compute)
-            .access(scene_color, Access::Sampled)
+            .access(metered_color, Access::Sampled)
             .access(histogram, Access::StorageWrite)
             .build();
         record(id, PassBody::LuminanceHistogram, &mut bodies);
@@ -1716,6 +2468,18 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         histogram
     });
 
+    // After the metering, so what it copies is what the tonemap applies to
+    // this frame; the next frame's resolve reads it. See `upscaler` for why
+    // the resolve cannot read this frame's.
+    if let Some(vendor) = vendor_resolve {
+        let id = builder
+            .pass("upscaler_exposure", PassKind::Compute)
+            .access(exposure, Access::StorageRead)
+            .access(vendor.exposure, Access::StorageWrite)
+            .build();
+        record(id, PassBody::UpscalerExposure, &mut bodies);
+    }
+
     let bloom = (config.bloom_mips > 0).then(|| {
         let mips = config.bloom_mips as usize;
         let mut down = [None; MAX_BLOOM_MIPS];
@@ -1728,12 +2492,12 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             let shift = level as u32 + 1;
             down[level] = Some(builder.create_image(
                 BLOOM_DOWN_NAMES[level],
-                ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(shift)),
+                ImageDesc::new(HDR_FORMAT).extent(Extent::OutputDiv(shift)),
             ));
             if level + 1 < mips {
                 up[level] = Some(builder.create_image(
                     BLOOM_UP_NAMES[level],
-                    ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(shift)),
+                    ImageDesc::new(HDR_FORMAT).extent(Extent::OutputDiv(shift)),
                 ));
             }
         }
@@ -1795,6 +2559,18 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .build();
     record(id, PassBody::Tonemap, &mut bodies);
 
+    // Over every pixel the tonemap wrote, and under everything drawn after it:
+    // the traced scene replaces the picture, not the editor's marks on it.
+    if let (true, Some(ray)) = (config.ray_debug, ray) {
+        let id = builder
+            .pass("ray_debug", PassKind::Inline)
+            .access(ray.scene, Access::AccelerationStructureRead)
+            .access(object_transforms, Access::StorageRead)
+            .access(swapchain_color, Access::ColorAttachment)
+            .build();
+        record(id, PassBody::RayDebug, &mut bodies);
+    }
+
     // First onto the tonemapped image, so the game's UI and every other mark the
     // editor makes stay on top of it. Over the shaded frame it reads the prepass
     // depth to hide covered edges — read-only, so the prepass stays its only
@@ -1806,14 +2582,20 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .flatten()
         .map(|mode| {
             let depth = match mode {
-                super::wireframe::Wireframe::OverShaded => prepass.as_ref().map(|p| p.depth),
+                super::wireframe::Wireframe::OverShaded => prepass.as_ref().map(|p| {
+                    if upscaled {
+                        EdgeDepth::Sampled(p.depth)
+                    } else {
+                        EdgeDepth::Attached(p.depth)
+                    }
+                }),
                 super::wireframe::Wireframe::Alone => None,
             };
             let mut pass = builder
                 .pass("wireframe", PassKind::Inline)
                 .access(swapchain_color, Access::ColorAttachment);
-            if let Some(depth) = depth {
-                pass = pass.access(depth, Access::DepthAttachmentRead);
+            if let Some((depth, access)) = depth.map(EdgeDepth::access) {
+                pass = pass.access(depth, access);
             }
             record(pass.build(), PassBody::Wireframe, &mut bodies);
             (mode, depth)
@@ -1835,7 +2617,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // Its own target rather than the depth or stencil of the scene: the
         // outline is the editor's, drawn after the frame is finished, and the
         // frame's targets are resolved and gone by then. See `vulkan::outline`.
-        let mask = builder.create_image("outline_mask", ImageDesc::new(OUTLINE_MASK_FORMAT));
+        let mask = builder.create_image(
+            "outline_mask",
+            ImageDesc::new(OUTLINE_MASK_FORMAT).extent(Extent::Output),
+        );
         let id = builder
             .pass("outline_mask", PassKind::Inline)
             .access(mask, Access::ColorAttachment)
@@ -1907,7 +2692,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let screenshot = config.screenshot.map(|view| {
         let image = builder.import_image(
             "screenshot",
-            ImageDesc::new(config.color_format),
+            ImageDesc::new(config.color_format).extent(Extent::Output),
             ImageLayout::Undefined,
             ImageLayout::ShaderReadOnlyOptimal,
         );
@@ -1934,7 +2719,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             over(
                 "screenshot_wireframe",
                 PassBody::ScreenshotWireframe,
-                depth.map(|depth| (depth, Access::DepthAttachmentRead)),
+                depth.map(EdgeDepth::access),
             );
         }
         if view != ShotView::Scene && config.ui {
@@ -1982,6 +2767,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             swapchain_color,
             hdr_color,
             scene_color,
+            metered_color,
+            path,
             msaa,
             exposure,
             histogram,
@@ -1996,6 +2783,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             transparency,
             refraction,
             taa,
+            vendor_resolve,
             dof,
             motion_blur,
             shadow_atlas,
@@ -2004,6 +2792,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             wireframe,
             material_preview,
             screenshot,
+            ray,
+            gi,
+            gather,
         },
         bodies,
     })

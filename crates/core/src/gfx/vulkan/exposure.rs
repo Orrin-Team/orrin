@@ -79,6 +79,7 @@ impl ExposurePass {
             compare: false,
             anisotropy: None,
             max_lod: Some(0.0),
+            lod_bias: 0.0,
         });
 
         // Zeroed at creation and thereafter reset by the averaging pass itself,

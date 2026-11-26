@@ -30,7 +30,7 @@ use vulkano::sync::Sharing;
 
 use super::convert::{vk_format, vk_image_usage, vk_samples};
 use super::driver::VkDriver;
-use crate::gfx::graph::{FrameGraph, ResourceId};
+use crate::gfx::graph::{Extents, FrameGraph, ResourceId};
 use crate::gfx::images::{ImageEntry, ImageTable};
 use crate::gfx::rhi::TextureViewId;
 
@@ -138,18 +138,18 @@ pub(super) struct GraphImages {
     /// an object drifts on or off screen, which without this would hitch every
     /// few frames.
     ///
-    /// Cleared on resize rather than allowed to accumulate: `Extent::Frame`
-    /// resolves differently then, so every entry keyed at the old size is dead
+    /// Cleared on resize rather than allowed to accumulate: the frame's extents
+    /// resolve differently then, so every entry keyed at the old size is dead
     /// weight no lookup will ever hit again.
     cache: HashMap<ImageKey, Views>,
     /// The memory the graph's alias groups share, so that a structural toggle
     /// re-binds the group it already allocated rather than allocating a second
     /// one beside it. Cleared on resize with `cache`, and for the same reason.
     blocks: HashMap<BlockKey, Arc<DeviceMemory>>,
-    /// What [`Extent::Frame`](crate::gfx::graph::Extent::Frame) resolved to when
-    /// these were allocated, so a resize is a comparison rather than a flag
+    /// What the frame's two extents were when these were allocated, so a
+    /// resize or a change of upscaling is a comparison rather than a flag
     /// somebody has to remember to set.
-    extent: [u32; 2],
+    extents: Extents,
 }
 
 impl GraphImages {
@@ -158,7 +158,7 @@ impl GraphImages {
         ctx: &super::context::VkContext,
         driver: &VkDriver,
         graph: &FrameGraph,
-        extent: [u32; 2],
+        extents: Extents,
         slots: usize,
     ) -> Self {
         let mut images = Self {
@@ -166,9 +166,9 @@ impl GraphImages {
             slot: 0,
             cache: HashMap::new(),
             blocks: HashMap::new(),
-            extent,
+            extents,
         };
-        images.rebuild(memory, ctx, driver, graph, extent, slots);
+        images.rebuild(memory, ctx, driver, graph, extents, slots);
         images
     }
 
@@ -194,7 +194,7 @@ impl GraphImages {
         ctx: &super::context::VkContext,
         driver: &VkDriver,
         graph: &FrameGraph,
-        extent: [u32; 2],
+        extents: Extents,
         slots: usize,
     ) {
         // A target that is only ever an attachment never leaves the render pass
@@ -219,7 +219,7 @@ impl GraphImages {
             ..Default::default()
         };
 
-        if self.extent != extent {
+        if self.extents != extents {
             for views in self.cache.values() {
                 driver.destroy_texture(views.whole_id);
                 for &level in views.level_ids.iter().chain(&views.layer_ids) {
@@ -228,7 +228,7 @@ impl GraphImages {
             }
             self.cache.clear();
             self.blocks.clear();
-            self.extent = extent;
+            self.extents = extents;
         }
 
         // Which transients the compiler found are never alive at the same time,
@@ -256,7 +256,7 @@ impl GraphImages {
         for slot in 0..slots {
             let mut views = vec![None; graph.resource_count()];
             for (id, image) in graph.transient_images() {
-                let extent = image.desc.extent.resolve(extent);
+                let extent = image.desc.extent.resolve(extents);
                 let mip_levels = image.desc.mip_levels.min(max_mip_levels(extent));
                 // Vulkan has no arrayed 3D image, so the two are a declaration
                 // mistake together rather than a shape to resolve a winner for.
@@ -395,8 +395,8 @@ impl GraphImages {
         self.slot = self.slot.min(slots.saturating_sub(1));
     }
 
-    pub fn is_stale(&self, extent: [u32; 2]) -> bool {
-        self.extent != extent
+    pub fn is_stale(&self, extents: Extents) -> bool {
+        self.extents != extents
     }
 
     /// The view for a graph-owned image.
@@ -610,8 +610,14 @@ mod tests {
         let driver = VkDriver::new(ctx.clone(), 2);
         let (graph, pyramid) = pyramid_graph(5);
 
-        let mut images =
-            GraphImages::allocate(&ctx.memory_allocator, &ctx, &driver, &graph, [64, 64], 1);
+        let mut images = GraphImages::allocate(
+            &ctx.memory_allocator,
+            &ctx,
+            &driver,
+            &graph,
+            Extents::native([64, 64]),
+            1,
+        );
         let first: Vec<_> = images.table().mip_textures(pyramid).to_vec();
         assert_eq!(first.len(), 5);
         for (level, id) in first.iter().enumerate() {
@@ -628,7 +634,7 @@ mod tests {
             &ctx,
             &driver,
             &recompiled,
-            [64, 64],
+            Extents::native([64, 64]),
             1,
         );
         let after = images.table();

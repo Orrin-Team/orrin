@@ -1,0 +1,150 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+
+// One axis of the final gather's spatial filter, at the gather's resolution:
+// a Gaussian whose taps are weighted by whether they are the same surface —
+// the same plane and a like normal — and by how alike the distances their rays
+// went are, so a contact's short rays are not averaged with the open floor's
+// long ones and the indirect shadow under a small object keeps its edge (id
+// Tech 8). Run once along each axis. Not separable, strictly, since the
+// weights differ from one row to the next; that is accepted for the cost.
+//
+// The kernel is widest where the history is shortest: a texel disoccluded this
+// frame has one ray, and is spread over more of its neighbours' than one that
+// has averaged a full history.
+//
+// Run a second time with its taps further apart, over what the first run
+// left (Dammertz et al. 2010): a room lit by one small bright thing, which a
+// few rays in a hundred meet, is still blotched after a history and a kernel
+// a few texels wide, and a kernel wide enough in one run is taps by the
+// dozen.
+//
+// A workgroup is a line of texels along the axis, and reads each texel its
+// taps reach once into shared memory: its depth and normal at the frame's
+// resolution, the point they make, its distance and its three layers. Read
+// per tap, a texel was read by each of the nine to seventeen it is a tap of,
+// and that was the pass's cost.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) uniform texture2D u_depth;
+layout(set = 0, binding = 1) uniform texture2D u_normal;
+// The three layers of harmonics to filter, and the accumulation's fourth
+// beside them for each texel's count and its rays' distance.
+layout(set = 0, binding = 2) uniform texture2DArray u_source;
+layout(set = 0, binding = 3) uniform texture2DArray u_meta;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2DArray u_filtered;
+#define ORRIN_GATHER_BLOCK_BINDING 5
+#include "gi_gather.glsl"
+
+// The axis, times how many texels apart this run's taps are.
+layout(push_constant) uniform Axis {
+    ivec2 step;
+} axis;
+
+const int WIDEST = 8;
+// The second run's taps either side.
+const float WIDE = 6.0;
+
+// `LINE` and `WIDE_STRIDE` in `gi_gather.rs`.
+const int LINE = 64;
+const int WIDE_STRIDE = 3;
+// The most texels past either end of the line a tap reaches: the second run's.
+const int REACH = int(WIDE) * WIDE_STRIDE;
+const int SPAN = LINE + 2 * REACH;
+
+shared vec3 s_position[SPAN];
+shared vec3 s_normal[SPAN];
+shared float s_reach[SPAN];
+// The three layers as the half floats they are stored as, so exactly.
+shared uvec2 s_source[3][SPAN];
+// In the image and not the sky.
+shared bool s_surface[SPAN];
+
+void main() {
+    bool vertical = axis.step.y != 0;
+    int stride = abs(axis.step.x) + abs(axis.step.y);
+    bool wide = stride > 1;
+    ivec2 along = vertical ? ivec2(0, 1) : ivec2(1, 0);
+    ivec2 first = vertical
+        ? ivec2(gl_WorkGroupID.y, gl_WorkGroupID.x * LINE)
+        : ivec2(gl_WorkGroupID.x * LINE, gl_WorkGroupID.y);
+    int index = int(gl_LocalInvocationID.x);
+    ivec2 low = first + along * index;
+    ivec2 size = imageSize(u_filtered).xy;
+    ivec2 full = textureSize(u_depth, 0);
+
+    int reach_past = wide ? REACH : WIDEST;
+    for (int i = index; i < LINE + 2 * reach_past; i += LINE) {
+        int slot = i - reach_past + REACH;
+        ivec2 q = first + along * (i - reach_past);
+        bool surface = false;
+        if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, size))) {
+            ivec2 t = gather_texel(q, full);
+            float d = texelFetch(u_depth, t, 0).r;
+            if (!depth_is_far(d)) {
+                surface = true;
+                s_position[slot] = gather_position(t, d, full);
+                s_normal[slot] = gather_normal(t);
+                s_reach[slot] = texelFetch(u_meta, ivec3(q, GATHER_META), 0).z;
+                for (int layer = 0; layer < 3; ++layer) {
+                    vec4 v = texelFetch(u_source, ivec3(q, layer), 0);
+                    s_source[layer][slot] = uvec2(packHalf2x16(v.xy), packHalf2x16(v.zw));
+                }
+            }
+        }
+        s_surface[slot] = surface;
+    }
+    barrier();
+
+    if (any(greaterThanEqual(low, size))) {
+        return;
+    }
+    int centre = index + REACH;
+    if (!s_surface[centre]) {
+        for (int layer = 0; layer < 3; ++layer) {
+            imageStore(u_filtered, ivec3(low, layer), vec4(0.0));
+        }
+        return;
+    }
+    vec3 position = s_position[centre];
+    vec3 normal = s_normal[centre];
+    float far = distance(position, gather.camera.xyz);
+    float count = texelFetch(u_meta, ivec3(low, GATHER_META), 0).x;
+    float reach = s_reach[centre];
+
+    // Four texels either side once the history is full, eight for one ray;
+    // the second run's are the same count whatever the history.
+    float radius = wide
+        ? WIDE
+        : mix(4.0, float(WIDEST), clamp(1.0 - (count - 1.0) / 15.0, 0.0, 1.0));
+    float sigma = radius * 0.5;
+
+    vec4 sum[3] = vec4[3](vec4(0.0), vec4(0.0), vec4(0.0));
+    float total = 0.0;
+    for (int k = -WIDEST; k <= WIDEST; ++k) {
+        if (float(abs(k)) > radius) {
+            continue;
+        }
+        int slot = centre + stride * k;
+        if (!s_surface[slot]) {
+            continue;
+        }
+        float plane = gather_plane(position, normal, s_position[slot], far);
+        float facing = max(dot(normal, s_normal[slot]), 0.0);
+        float other = s_reach[slot];
+        float w = exp(-float(k * k) / (2.0 * sigma * sigma))
+                * exp(-plane * plane)
+                * pow(facing, 8.0)
+                / (1.0 + 4.0 * abs(other - reach) / (other + reach + 0.1));
+        for (int layer = 0; layer < 3; ++layer) {
+            uvec2 packed = s_source[layer][slot];
+            sum[layer] += vec4(unpackHalf2x16(packed.x), unpackHalf2x16(packed.y)) * w;
+        }
+        total += w;
+    }
+    // The centre always weighs one, so the total is never nothing.
+    for (int layer = 0; layer < 3; ++layer) {
+        imageStore(u_filtered, ivec3(low, layer), sum[layer] / total);
+    }
+}

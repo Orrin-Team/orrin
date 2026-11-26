@@ -41,9 +41,9 @@ use crate::scene::registry::RENDER_SETTINGS;
 use crate::scene::render_settings;
 use crate::scene::{
     AmbientLight, BloomSettings, Camera, ContactShadowSettings, DecalSettings, DofSettings,
-    EnvironmentSettings, FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings,
-    ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
-    TransparencySettings,
+    EnvironmentSettings, FogSettings, GiSettings, HdrSettings, MotionBlurSettings,
+    RayTracingSettings, RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings,
+    SubsurfaceSettings, TaaSettings, TransparencySettings,
 };
 
 /// What the stand-in for the HDRI file dialog picks, in tests: `None` inside
@@ -91,7 +91,15 @@ const SCREEN_SPACE: &[Section] = &[
         "Temporal AA",
         Some("Jitter the camera each frame and accumulate the results"),
         icons::frame_corners(),
-        &["Enabled", "Feedback", "Jitter", "4x MSAA"],
+        &[
+            "Enabled",
+            "Feedback",
+            "Jitter",
+            "4x MSAA",
+            "Upscaling",
+            "Upscaler",
+            "Running",
+        ],
         temporal_aa,
     ),
     section(
@@ -262,6 +270,34 @@ const LIGHTING: &[Section] = &[
     ),
 ];
 
+const RAYS: &[Section] = &[
+    section(
+        "Ray tracing",
+        Some("Trace rays against a copy of the scene, on a GPU that can"),
+        icons::bounding_box(),
+        &["Enabled", "Distance", "Reflections", "Debug view"],
+        ray_tracing,
+    ),
+    section(
+        "Global illumination",
+        Some("Light that bounced, from probes traced round the camera"),
+        icons::lightbulb(),
+        &[
+            "Enabled",
+            "Quality",
+            "Spacing",
+            "Hysteresis",
+            "Reflections",
+            "Fog",
+            "Final gather",
+            "Gather resolution",
+            "Gather history",
+            "Debug view",
+        ],
+        global_illumination,
+    ),
+];
+
 const LENS: &[Section] = &[
     section(
         "Lens",
@@ -280,7 +316,7 @@ const LENS: &[Section] = &[
 ];
 
 /// The groups the columns are dealt, in reading order.
-const COLUMNS: [&[Section]; 4] = [SCREEN_SPACE, SHADOWS, LIGHTING, LENS];
+const COLUMNS: [&[Section]; 5] = [SCREEN_SPACE, SHADOWS, LIGHTING, RAYS, LENS];
 
 const EDITOR_CAMERA: Section = Section {
     title: "Editor camera",
@@ -514,6 +550,57 @@ fn temporal_aa(ui: &mut egui::Ui, world: &World, rows: Rows) {
              forward pass borrows the prepass depth and shades each pixel once",
         );
     }
+    if rows.shows("Upscaling") {
+        use crate::scene::Upscaling;
+        widgets::property(ui, "Upscaling", |ui| {
+            egui::ComboBox::from_id_salt("taa_upscaling")
+                .selected_text(taa.upscaling.label())
+                .show_ui(ui, |ui| {
+                    for mode in Upscaling::ALL {
+                        ui.selectable_value(&mut taa.upscaling, mode, mode.label());
+                    }
+                })
+                .response
+        })
+        .on_hover_text(
+            "Render the scene below the window's resolution and let the temporal \
+             resolve bring it up. Any mode but native turns the resolve on",
+        );
+    }
+    if rows.shows("Upscaler") {
+        use crate::scene::Upscaler;
+        widgets::property(ui, "Upscaler", |ui| {
+            egui::ComboBox::from_id_salt("taa_upscaler")
+                .selected_text(taa.upscaler.label())
+                .show_ui(ui, |ui| {
+                    for upscaler in Upscaler::ALL {
+                        ui.selectable_value(&mut taa.upscaler, upscaler, upscaler.label());
+                    }
+                })
+                .response
+        })
+        .on_hover_text(
+            "What resolves the frame. A vendor's upscaler runs where its runtime \
+             does, and the built-in resolve stands in everywhere else",
+        );
+    }
+    // What the renderer did with the request, which only it can know: whether
+    // the vendor's runtime was found and took this device.
+    if rows.shows("Running")
+        && let Some(status) = world.get_resource::<crate::scene::UpscalerStatus>()
+    {
+        widgets::property(ui, "Running", |ui| {
+            let running = status.running.map_or("Nothing", |running| running.label());
+            let response = match (&status.provider, &status.reason) {
+                (Some(provider), _) => ui.label(format!("{running} {provider}")),
+                (None, Some(_)) => ui.label(format!("{running}, not {}", status.asked.label())),
+                (None, None) => ui.label(running),
+            };
+            if let Some(reason) = &status.reason {
+                response.on_hover_text(reason.as_ref());
+            }
+        });
+    }
 }
 
 fn reflections(ui: &mut egui::Ui, world: &World, rows: Rows) {
@@ -563,6 +650,172 @@ fn reflections(ui: &mut egui::Ui, world: &World, rows: Rows) {
     if rows.shows("Steps") {
         slider(ui, "Steps", egui::Slider::new(&mut ssr.max_steps, 8..=128))
             .on_hover_text("A step crosses a whole cell of the depth pyramid, not a texel");
+    }
+}
+
+fn ray_tracing(ui: &mut egui::Ui, world: &World, rows: Rows) {
+    let mut rays = world.resource_mut::<RayTracingSettings>();
+    if rows.shows("Enabled") {
+        toggle(ui, "Enabled", &mut rays.enabled).on_hover_text(
+            "Nothing is built until something traces, so this alone costs nothing. \
+             Ignored on a GPU without ray queries",
+        );
+    }
+    if rows.shows("Distance") {
+        slider(
+            ui,
+            "Distance",
+            egui::Slider::new(&mut rays.distance, 10.0..=2000.0)
+                .logarithmic(true)
+                .suffix(" m"),
+        )
+        .on_hover_text("How far from the camera an object still stands in the traced scene");
+    }
+    if rows.shows("Reflections") {
+        toggle(ui, "Reflections", &mut rays.reflections).on_hover_text(
+            "Where a screen-space reflection has no answer, trace the scene itself. \
+             Needs Screen-space reflections on",
+        );
+    }
+    if rows.shows("Debug view") {
+        use crate::scene::RayDebugView;
+        widgets::property(ui, "Debug view", |ui| {
+            let name = |view| match view {
+                RayDebugView::None => "None",
+                RayDebugView::HitDistance => "Hit distance",
+                RayDebugView::Instance => "Instance",
+                RayDebugView::GeometricNormal => "Geometric normal",
+                // A capture's, and not offered here: it needs a scene held
+                // still for as long as it is watched.
+                RayDebugView::PathTraced => "Path traced",
+            };
+            egui::ComboBox::from_id_salt("ray_debug_view")
+                .selected_text(name(rays.debug_view))
+                .show_ui(ui, |ui| {
+                    for view in [
+                        RayDebugView::None,
+                        RayDebugView::HitDistance,
+                        RayDebugView::Instance,
+                        RayDebugView::GeometricNormal,
+                    ] {
+                        ui.selectable_value(&mut rays.debug_view, view, name(view));
+                    }
+                })
+                .response
+        });
+    }
+}
+
+fn global_illumination(ui: &mut egui::Ui, world: &World, rows: Rows) {
+    let mut gi = world.resource_mut::<GiSettings>();
+    if rows.shows("Enabled") {
+        toggle(ui, "Enabled", &mut gi.enabled).on_hover_text(
+            "Needs Ray tracing on, and a GPU with ray queries. Off, the sky lights \
+             everything as if nothing stood in its way",
+        );
+    }
+    if rows.shows("Quality") {
+        // The issue's three tiers, as the two numbers they set.
+        let tiers = [("High", 16, 64), ("Medium", 16, 32), ("Low", 12, 16)];
+        let current = tiers
+            .iter()
+            .find(|(_, probes, rays)| gi.probes == *probes && gi.rays == *rays)
+            .map_or("Custom", |(name, ..)| *name);
+        widgets::property(ui, "Quality", |ui| {
+            egui::ComboBox::from_id_salt("gi_quality")
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for (name, probes, rays) in tiers {
+                        if ui.selectable_label(current == name, name).clicked() {
+                            gi.probes = probes;
+                            gi.rays = rays;
+                        }
+                    }
+                })
+                .response
+        })
+        .on_hover_text("Probes a side of each of the six cascades, and rays a probe traces");
+    }
+    if rows.shows("Spacing") {
+        slider(
+            ui,
+            "Spacing",
+            egui::Slider::new(&mut gi.spacing, 0.25..=4.0)
+                .logarithmic(true)
+                .suffix(" m"),
+        )
+        .on_hover_text("Between the finest cascade's probes. Light leaks through anything thinner");
+    }
+    if rows.shows("Hysteresis") {
+        slider(
+            ui,
+            "Hysteresis",
+            egui::Slider::new(&mut gi.hysteresis, 0.8..=0.99),
+        )
+        .on_hover_text("How much a probe keeps of what it held at each update: steadier, slower");
+    }
+    if rows.shows("Reflections") {
+        toggle(ui, "Reflections", &mut gi.reflections)
+            .on_hover_text("Dim the sky's reflection where less of its light reaches");
+    }
+    if rows.shows("Fog") {
+        toggle(ui, "Fog", &mut gi.fog)
+            .on_hover_text("The volumetric fog scatters the probes' light, not the flat ambient");
+    }
+    if rows.shows("Final gather") {
+        toggle(ui, "Final gather", &mut gi.gather).on_hover_text(
+            "A ray per pixel at reduced resolution, for what is smaller than the probes: \
+             the shadow and colour a small object casts. Opaque surfaces only",
+        );
+    }
+    if rows.shows("Gather resolution") {
+        use crate::scene::GiGatherResolution;
+        widgets::property(ui, "Gather resolution", |ui| {
+            let name = |resolution| match resolution {
+                GiGatherResolution::Half => "Half",
+                GiGatherResolution::Quarter => "Quarter",
+            };
+            egui::ComboBox::from_id_salt("gi_gather_resolution")
+                .selected_text(name(gi.gather_resolution))
+                .show_ui(ui, |ui| {
+                    for resolution in [GiGatherResolution::Half, GiGatherResolution::Quarter] {
+                        ui.selectable_value(
+                            &mut gi.gather_resolution,
+                            resolution,
+                            name(resolution),
+                        );
+                    }
+                })
+                .response
+        })
+        .on_hover_text("Of the frame each way");
+    }
+    if rows.shows("Gather history") {
+        slider(
+            ui,
+            "Gather history",
+            egui::Slider::new(&mut gi.gather_history, 1..=64).suffix(" frames"),
+        )
+        .on_hover_text(
+            "The frames a pixel averages where its rays agree: longer is quieter and lags more",
+        );
+    }
+    if rows.shows("Debug view") {
+        use crate::scene::GiDebugView;
+        widgets::property(ui, "Debug view", |ui| {
+            let name = |view| match view {
+                GiDebugView::None => "None",
+                GiDebugView::Irradiance => "Irradiance",
+            };
+            egui::ComboBox::from_id_salt("gi_debug_view")
+                .selected_text(name(gi.debug_view))
+                .show_ui(ui, |ui| {
+                    for view in [GiDebugView::None, GiDebugView::Irradiance] {
+                        ui.selectable_value(&mut gi.debug_view, view, name(view));
+                    }
+                })
+                .response
+        });
     }
 }
 

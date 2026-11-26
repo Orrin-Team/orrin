@@ -1,5 +1,6 @@
 mod library;
 mod physics;
+mod rooms;
 mod scene;
 mod showcase;
 mod sponza;
@@ -47,6 +48,7 @@ pub fn install_library(world: &mut World, backend: &mut impl RenderBackend) {
     world.insert_resource(asset_previews);
 }
 pub use physics::{build_physics_scene, spawn_from_clicks};
+pub use rooms::build_rooms_scene;
 pub use showcase::build_showcase_scene;
 pub use sponza::{begin_sponza_scene, build_sponza_scene, finish_pending_scene};
 pub use stress::{StressSpec, spawn_stress_scene};
@@ -85,6 +87,9 @@ pub enum SceneChoice {
     /// more. A testbed rather than a fourth thing to look at — nothing is
     /// captured from it.
     Physics,
+    /// [`build_rooms_scene`]: closed rooms for the global illumination, one
+    /// behind a thin wall and one lit by a glowing panel alone.
+    Rooms,
 }
 
 impl SceneChoice {
@@ -102,10 +107,11 @@ impl SceneChoice {
                 "showcase" | "courtyard" => Self::Showcase,
                 "sponza" | "crytek" => Self::Sponza,
                 "physics" | "jolt" => Self::Physics,
+                "rooms" | "gi" => Self::Rooms,
                 other => {
                     tracing::warn!(
                         "ORRIN_SCENE: unknown scene `{other}` (expected demo, showcase, \
-                         sponza or physics); opening the demo scene"
+                         sponza, physics or rooms); opening the demo scene"
                     );
                     Self::Demo
                 }
@@ -121,6 +127,7 @@ impl SceneChoice {
             Self::Showcase => build_showcase_scene(world, backend),
             Self::Sponza => build_sponza_scene(world, backend),
             Self::Physics => build_physics_scene(world, backend),
+            Self::Rooms => build_rooms_scene(world, backend),
         }
     }
 
@@ -145,6 +152,7 @@ impl SceneChoice {
             Self::Showcase => "showcase",
             Self::Sponza => "sponza",
             Self::Physics => "physics",
+            Self::Rooms => "rooms",
         }
     }
 }

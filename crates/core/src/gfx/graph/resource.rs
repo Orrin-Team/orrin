@@ -12,30 +12,80 @@ impl ResourceId {
     }
 }
 
-/// How a graph-owned image is sized.
+/// How a graph-owned image is sized: against one of the frame's two extents,
+/// or not against the frame at all.
+///
+/// Two, because the scene is rendered at a fraction of what is presented and
+/// the temporal resolve brings it up: everything up to the resolve is at the
+/// render extent, and the resolve's output and everything after it at the
+/// output extent. Named here and resolved in one place, so no pass works out a
+/// size of its own and no two can disagree about which extent an image is at.
+///
+/// With upscaling off the two are one extent, and the compiler plans them as
+/// one — see [`GraphBuilder::upscale`](super::GraphBuilder::upscale) — so such
+/// a frame is the frame there was before there were two.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Extent {
-    /// Tracks the frame's render extent, so a swapchain resize reallocates it.
-    Frame,
-    /// The frame's extent halved `n` times — a level of a downsample chain, and
-    /// like [`Frame`](Extent::Frame) it follows a resize.
+    /// The extent the scene is rendered at, so a resize or a change of the
+    /// upscaling mode reallocates it.
+    Render,
+    /// The render extent halved `n` times — a level of a downsample chain, and
+    /// like [`Render`](Extent::Render) it follows a resize.
     ///
     /// A shift rather than a ratio because a bloom chain's levels must land on
     /// exactly the sizes successive halvings produce: a level computed any other
     /// way disagrees with the one the pass above it sampled from by a texel at
     /// odd sizes, and the filter taps drift off centre.
-    FrameDiv(u32),
+    RenderDiv(u32),
+    /// The extent the frame is presented at: the window's, or a capture's.
+    Output,
+    /// The output extent halved `n` times, for the reason
+    /// [`RenderDiv`](Extent::RenderDiv) is a shift.
+    OutputDiv(u32),
     Fixed([u32; 2]),
 }
 
+/// What the two named extents are for one allocation of a frame's images.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Extents {
+    pub render: [u32; 2],
+    pub output: [u32; 2],
+}
+
+impl Extents {
+    /// A frame rendered at the extent it is presented at.
+    pub fn native(output: [u32; 2]) -> Self {
+        Self {
+            render: output,
+            output,
+        }
+    }
+}
+
 impl Extent {
-    pub fn resolve(self, frame: [u32; 2]) -> [u32; 2] {
+    pub fn resolve(self, extents: Extents) -> [u32; 2] {
+        // Floored at one: halving an odd extent far enough reaches zero, and a
+        // zero-extent image is not one Vulkan will create.
+        let halved =
+            |frame: [u32; 2], shift: u32| [(frame[0] >> shift).max(1), (frame[1] >> shift).max(1)];
         match self {
-            Extent::Frame => frame,
-            // Floored at one: halving an odd extent far enough reaches zero, and
-            // a zero-extent image is not one Vulkan will create.
-            Extent::FrameDiv(shift) => [(frame[0] >> shift).max(1), (frame[1] >> shift).max(1)],
+            Extent::Render => extents.render,
+            Extent::RenderDiv(shift) => halved(extents.render, shift),
+            Extent::Output => extents.output,
+            Extent::OutputDiv(shift) => halved(extents.output, shift),
             Extent::Fixed(extent) => extent,
+        }
+    }
+
+    /// This extent as the compiler plans it: itself in an upscaled frame, and
+    /// in one that is not, the output's extents folded into the render's they
+    /// are equal to — so two images that differ only in which name they gave
+    /// one size are still interchangeable.
+    pub fn folded(self, upscaled: bool) -> Self {
+        match self {
+            Extent::Output if !upscaled => Extent::Render,
+            Extent::OutputDiv(shift) if !upscaled => Extent::RenderDiv(shift),
+            other => other,
         }
     }
 }
@@ -95,7 +145,7 @@ impl ImageDesc {
     pub fn new(format: Format) -> Self {
         Self {
             format,
-            extent: Extent::Frame,
+            extent: Extent::Render,
             samples: SampleCount::Sample1,
             array_layers: None,
             depth: None,
@@ -108,8 +158,8 @@ impl ImageDesc {
         self
     }
 
-    /// Size this image independently of the frame's extent, so a swapchain
-    /// resize leaves it alone.
+    /// Size this image against another of the frame's extents than the render
+    /// extent it defaults to, or against none.
     pub fn extent(mut self, extent: Extent) -> Self {
         self.extent = extent;
         self
@@ -157,6 +207,10 @@ pub(super) enum ResourceKind {
     /// the graph. There is deliberately no `create_buffer` to leave dead
     /// allocation paths behind.
     ImportedBuffer,
+    /// What a ray is traced against. Imported for the reason a buffer is: the
+    /// renderer owns it across frames, and the graph owns only the order and
+    /// the barriers between the passes that build it and the ones that trace.
+    ImportedAccelerationStructure,
 }
 
 #[derive(Clone, Debug)]
@@ -166,14 +220,31 @@ pub(super) struct ResourceDecl {
 }
 
 impl ResourceDecl {
+    /// The image's description, for an image.
+    pub fn image_desc(&self) -> Option<&ImageDesc> {
+        match &self.kind {
+            ResourceKind::Transient(desc) | ResourceKind::Imported(desc, _) => Some(desc),
+            ResourceKind::ImportedBuffer | ResourceKind::ImportedAccelerationStructure => None,
+        }
+    }
+
     pub fn is_image(&self) -> bool {
-        !matches!(self.kind, ResourceKind::ImportedBuffer)
+        matches!(
+            self.kind,
+            ResourceKind::Transient(_) | ResourceKind::Imported(..)
+        )
+    }
+
+    pub fn is_acceleration_structure(&self) -> bool {
+        matches!(self.kind, ResourceKind::ImportedAccelerationStructure)
     }
 
     pub fn is_imported(&self) -> bool {
         matches!(
             self.kind,
-            ResourceKind::Imported(..) | ResourceKind::ImportedBuffer
+            ResourceKind::Imported(..)
+                | ResourceKind::ImportedBuffer
+                | ResourceKind::ImportedAccelerationStructure
         )
     }
 
@@ -188,7 +259,9 @@ impl ResourceDecl {
         match self.kind {
             ResourceKind::Transient(_) => ImageLayout::Undefined,
             ResourceKind::Imported(_, layouts) => layouts.entry,
-            ResourceKind::ImportedBuffer => ImageLayout::Undefined,
+            ResourceKind::ImportedBuffer | ResourceKind::ImportedAccelerationStructure => {
+                ImageLayout::Undefined
+            }
         }
     }
 
@@ -196,7 +269,9 @@ impl ResourceDecl {
     pub fn exit_layout(&self) -> Option<ImageLayout> {
         match self.kind {
             ResourceKind::Imported(_, layouts) => Some(layouts.exit),
-            ResourceKind::Transient(_) | ResourceKind::ImportedBuffer => None,
+            ResourceKind::Transient(_)
+            | ResourceKind::ImportedBuffer
+            | ResourceKind::ImportedAccelerationStructure => None,
         }
     }
 }

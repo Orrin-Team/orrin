@@ -283,6 +283,9 @@ impl MtlDriver {
                         self.write_sampler(writer.encoder(), resource.index, sampler);
                     }
                 }
+                BindingResource::SceneAccel => {
+                    unreachable!("Metal reports no ray tracing, so no pass binds a scene to trace")
+                }
                 BindingResource::Geometry(stream) => {
                     let Some(writer) = writer_of(resource.index) else {
                         continue;
@@ -294,6 +297,7 @@ impl MtlDriver {
                     let buffer = match stream {
                         crate::gfx::rhi::GeometryStream::Positions => &geometry.0.positions,
                         crate::gfx::rhi::GeometryStream::Indices => &geometry.0.indices,
+                        crate::gfx::rhi::GeometryStream::Surfaces => &geometry.0.surfaces,
                     };
                     // SAFETY: a live buffer, from its start.
                     unsafe {

@@ -1,0 +1,129 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+// The cells of the world radiance cache the probe rays used this frame, each
+// shaded once by the hit shading every traced pass runs, however many rays
+// landed in it. Dispatched over the list the compaction counted.
+//
+// A cell is shaded where the lowest-numbered ray that used it landed: that
+// ray is traced again over the last few centimetres to recover the surface,
+// and the radiance it sends every way alike is stored — what it emits, the
+// diffuse lobe of what each light lays on it, and the light that bounced to
+// it out of the irradiance volumes, which is how one bounce becomes many.
+// Only the diffuse lobe, because a cell is read by rays arriving from every
+// direction and a reflection belongs to one of them.
+//
+// Written into this frame's half of the pair, which next frame's update reads
+// for this frame's rays: the volumes this reads were written by this frame's
+// update, so the light they hold reaches the probes one update later.
+//
+// Averaged into what the cell held, over about `CELL_HISTORY` frames, or its
+// last `CELL_HISTORY` shadings where it is shaded every frame. Each shading is
+// from wherever this frame's ray landed in the cell, so a cell across the edge
+// of a sunlit patch is lit by one and in shade by the next; shaded afresh,
+// every probe ray that read the cell that frame read the same flip, which no
+// number of rays averages out. Averaged, the cell holds its own mean. By
+// frames and not by shadings alone, because a cell in a closed room may be
+// shaded once in six frames, and a lamp switched there would otherwise reach
+// its probes over seconds.
+//
+// A cell no probe ray used but the final gather asked for is shaded the same
+// way, from the gather ray the gather left in its own table.
+
+layout(local_size_x = 64) in;
+
+#define ORRIN_GI_TRACED_VISIBILITY
+#include "ray_shade.glsl"
+#include "gi_cache.glsl"
+
+layout(set = 0, binding = 0, std430) buffer GiCells {
+    GiCell gi_cells[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer GiRays {
+    GiRay gi_rays[];
+};
+layout(set = 0, binding = 2, std430) buffer GiRadiance {
+    uvec2 gi_radiance[];
+};
+layout(set = 0, binding = 3, std430) readonly buffer GiList {
+    uint gi_list_count;
+    uint gi_list[];
+};
+// What the gather's ray that asked for a cell met, by the cell's number:
+// where it landed and how far it went, and its direction in `meta.xyz`.
+layout(set = 0, binding = 4, std430) readonly buffer GiGatherHits {
+    GiRay gi_gather_hits[];
+};
+
+// The point the volumes are looked up from, a hair off its surface.
+vec3 shade_from;
+
+const float CELL_HISTORY = 8.0;
+
+// A ray to the probe rather than the probe's own account of how far it sees,
+// which is too coarse to stop all of what is behind a wall. This pass is
+// where light is fed back to the probes, and what gets into a closed room
+// beside a sunlit yard goes round its walls for seconds before it fades.
+bool gi_probe_hidden(vec3 probe) {
+    vec3 to_probe = probe - shade_from;
+    float far = length(to_probe);
+    return far > 1e-4 && ray_occluded(shade_from, to_probe / far, far);
+}
+
+void main() {
+    uint at = gl_GlobalInvocationID.x;
+    if (at >= gi_list_count) {
+        return;
+    }
+    uint cell = gi_list[at];
+    uint ray = gi_cells[cell].representative;
+    gi_cells[cell].representative = GI_NO_CELL;
+    uint since = gi.frame.x - gi_cells[cell].shaded;
+    gi_cells[cell].shaded = gi.frame.x;
+    if (ray == GI_NO_CELL) {
+        return;
+    }
+
+    GiRay landed;
+    vec3 direction;
+    if (ray == GI_GATHERED) {
+        landed = gi_gather_hits[cell];
+        direction = uintBitsToFloat(landed.meta.xyz);
+    } else {
+        landed = gi_rays[ray];
+        direction = gi_ray_direction(ray % gi.grid.y, gi.grid.y, ray / gi.grid.y);
+    }
+    float back = max(0.02, landed.hit.w * 1e-3);
+    RayHit hit = ray_closest(landed.hit.xyz - direction * back, direction, 0.0, back * 2.0);
+    if (!hit.found) {
+        return;
+    }
+    // The cone a probe's ray stands for — the probe's sphere shared between
+    // its rays — at the distance the ray went, not the few centimetres it was
+    // traced again: what a map is filtered by is what one ray sees of it.
+    float cone = sqrt(4.0 * PI / float(gi.grid.y));
+    RaySurface found = ray_surface(hit, direction, cone * landed.hit.w / max(hit.distance, 1e-4));
+    Surface s = found.s;
+    shade_from = found.lifted;
+    // The volumes, and the sky only past their reach. Not the sky where the
+    // volumes reach but have no probe ready to answer yet, as a surface the
+    // camera sees takes it: shaded into a cell, light that is not there would
+    // go round a closed room's walls bounce after bounce, and outlast the
+    // probes' own settling by seconds.
+    vec4 local = gi_irradiance(found.position, s.N, s.V);
+    vec3 irradiance = local.rgb + sh_irradiance(s.N) * (1.0 - gi_reach(found.position));
+    vec3 radiance = found.emissive + ray_lights(found, true)
+                  + irradiance * s.albedo * (1.0 - s.metallic);
+    // Into half floats, so held to their range; and a hit whose arithmetic
+    // went wrong would light every probe that reads the cell.
+    radiance = min(radiance, vec3(65000.0));
+    if (any(isnan(radiance))) {
+        return;
+    }
+    vec4 held = gi_cell_light(gi_radiance[cell]);
+    float shadings = min(held.a, CELL_HISTORY - 1.0);
+    float take = max(1.0 / (shadings + 1.0), 1.0 - pow(1.0 - 1.0 / CELL_HISTORY, float(since)));
+    radiance = mix(held.rgb, radiance, take);
+    gi_radiance[cell] = uvec2(packHalf2x16(radiance.rg), packHalf2x16(vec2(radiance.b, shadings + 1.0)));
+}

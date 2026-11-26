@@ -17,6 +17,12 @@
 // `u_hiz` (the nearest-depth pyramid from level 1 up), `u_depth`, `u_source`
 // (the lit frame's pyramid, based at half resolution) and `u_source_full` (the
 // lit frame itself).
+//
+// With `ORRIN_RAY_FALLBACK` defined, what the screen cannot answer is traced
+// against the scene's acceleration structure instead: the same ray, in the
+// world, shaded where it lands. The includer then includes `ray_shade.glsl`
+// first. The order is the one id Tech 8 gives: the screen when it can, then a
+// traced ray, then the environment.
 
 #ifndef ORRIN_SSR_MARCH_GLSL
 #define ORRIN_SSR_MARCH_GLSL
@@ -68,9 +74,10 @@ vec3 pyramid_smooth(vec2 uv, float level) {
                  + g1.x * textureLod(u_source, vec2(at1.x, at1.y), level).rgb);
 }
 
-// The reflection of the surface at `uv` (view-space normal `n`): rgb = the
-// radiance found, a = how much of it to believe, zero for a miss.
-vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness) {
+// What the screen holds of the reflection of the surface at `uv` (view-space
+// normal `n`): rgb = the radiance found, a = how much of it the screen can
+// vouch for, zero for a miss.
+vec4 march_reflection(vec2 uv, float depth, vec3 n, float roughness) {
     vec3 p = view_pos(uv, depth);
     vec3 v = normalize(-p); // toward the camera, view space
     vec3 l = reflect(-v, n);
@@ -217,11 +224,8 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness) {
     // does not contain — it is behind the viewer, or hidden by the surface doing
     // the reflecting.
     float facing = 1.0 - smoothstep(0.25, 0.75, dot(l, v));
-    // And a lobe wide enough to see most of the hemisphere is a reflection the
-    // prefiltered environment approximates better than a blur of the screen.
-    float smoothness = 1.0 - smoothstep(ssr.params.x * 0.6, ssr.params.x, roughness);
 
-    float confidence = behind * edge * facing * smoothness;
+    float confidence = behind * edge * facing;
 
     // The roughness is a cone around the exact ray, and it is read as one: the
     // pyramid level whose texel matches the cone's width at the hit carries the
@@ -252,6 +256,62 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness) {
         radiance = mix(textureLod(u_source_full, hit_uv, 0.0).rgb, radiance, lod);
     }
     return vec4(radiance, confidence);
+}
+
+#ifdef ORRIN_RAY_FALLBACK
+// Past the first of these a traced hit starts handing back to the environment,
+// and by the second it has. A hit is one point's radiance, sharp, where a rough
+// lobe wants a blur of everything round it, and nothing here can blur what is
+// not on the screen: on a mirror that is exact, and on a rough surface it is a
+// crisp image inside a soft one. Perceptual roughness.
+const float TRACED_FULL_ROUGHNESS = 0.15;
+const float TRACED_NO_ROUGHNESS = 0.3;
+
+// A pixel's own angle, near enough, in metres of cone per metre of ray: what
+// a mirror's reflection is filtered by at its hit.
+const float PIXEL_SPREAD = 0.0015;
+
+// The part of a reflection the screen could not vouch for, traced against the
+// scene itself and shaded where it lands. `found` is what the screen had; the
+// result is the two blended by how much each knows. A ray that leaves the
+// scene changes nothing: what is out there is the sky, and the environment
+// already answers for it.
+vec4 trace_past_the_screen(vec4 found, vec2 uv, float depth, vec3 n, float roughness) {
+    float reach = (1.0 - found.a)
+                * (1.0 - smoothstep(TRACED_FULL_ROUGHNESS, TRACED_NO_ROUGHNESS, roughness));
+    if (reach <= 0.0) {
+        return found;
+    }
+    vec3 p = view_pos(uv, depth);
+    vec3 l = reflect(normalize(p), n);
+    if (dot(l, n) <= 0.0) {
+        return found;
+    }
+    vec3 origin = (ssr.inv_view * vec4(p + n * max(0.02, 0.004 * -p.z), 1.0)).xyz;
+    vec3 direction = normalize(mat3(ssr.inv_view) * l);
+    RayHit hit = ray_closest(origin, direction, 0.0, RAY_FAR);
+    if (!hit.found) {
+        return found;
+    }
+    // The cone the screen's own hit is read through, as a slope.
+    float spread = PIXEL_SPREAD + roughness * roughness * 2.5;
+    vec3 traced = ray_shade(hit, direction, spread);
+    float total = found.a + reach;
+    return vec4((found.rgb * found.a + traced * reach) / total, total);
+}
+#endif
+
+// The reflection of the surface at `uv` (view-space normal `n`): rgb = the
+// radiance found, a = how much of it to believe, zero for a miss.
+vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness) {
+    vec4 found = march_reflection(uv, depth, n, roughness);
+#ifdef ORRIN_RAY_FALLBACK
+    found = trace_past_the_screen(found, uv, depth, n, roughness);
+#endif
+    // A lobe wide enough to see most of the hemisphere is a reflection the
+    // prefiltered environment approximates better than a blur of the screen.
+    float smoothness = 1.0 - smoothstep(ssr.params.x * 0.6, ssr.params.x, roughness);
+    return vec4(found.rgb, found.a * smoothness);
 }
 
 #endif

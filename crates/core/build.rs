@@ -14,6 +14,11 @@
 //! to agree with it: the widths table the layout was built from, a hash over it
 //! and every file under `shaders/`, and, with the `shader-compiler` feature, the
 //! files themselves.
+//!
+//! With the `dlss` feature on Windows it also links NVIDIA's NGX SDK, from the
+//! SDK root `ORRIN_DLSS_DIR` names: a static library that cannot be fetched
+//! here, or committed, so a build that asks for it and cannot find it fails
+//! naming the variable.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -133,7 +138,38 @@ fn camel(name: &str) -> String {
         .collect()
 }
 
+/// Link `nvsdk_ngx_d.lib`, the SDK's build for the dynamic C runtime that
+/// Rust's MSVC target uses, where the `dlss` feature is built for Windows.
+fn link_ngx() {
+    if env::var_os("CARGO_FEATURE_DLSS").is_none() || env::var_os("CARGO_CFG_WINDOWS").is_none() {
+        return;
+    }
+    println!("cargo:rerun-if-env-changed=ORRIN_DLSS_DIR");
+    let sdk = env::var_os("ORRIN_DLSS_DIR").unwrap_or_else(|| {
+        panic!(
+            "the `dlss` feature links NVIDIA's NGX SDK, and ORRIN_DLSS_DIR is not set: \
+             set it to the DLSS SDK's root, the folder holding `include` and `lib`"
+        )
+    });
+    let dir = PathBuf::from(sdk)
+        .join("lib")
+        .join("Windows_x86_64")
+        .join("x64");
+    let lib = dir.join("nvsdk_ngx_d.lib");
+    if !lib.is_file() {
+        panic!(
+            "the `dlss` feature links {}, which is not there: ORRIN_DLSS_DIR should name \
+             the DLSS SDK's root, the folder holding `include` and `lib`",
+            lib.display()
+        );
+    }
+    println!("cargo:rerun-if-changed={}", lib.display());
+    println!("cargo:rustc-link-search=native={}", dir.display());
+    println!("cargo:rustc-link-lib=static=nvsdk_ngx_d");
+}
+
 fn main() {
+    link_ngx();
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let shaders = manifest_dir.join("shaders");

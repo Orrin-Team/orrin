@@ -14,6 +14,7 @@ pub mod entities;
 pub mod entity_ref;
 mod environment;
 mod fog;
+mod gi;
 mod hdr;
 mod hierarchy;
 pub mod input;
@@ -27,6 +28,7 @@ mod play;
 pub mod prefab;
 mod present;
 mod previews;
+mod ray_tracing;
 pub mod registry;
 pub mod render_settings;
 mod shadow;
@@ -60,6 +62,7 @@ pub use dof::DofSettings;
 pub use editor_hidden::EditorHidden;
 pub use environment::{EnvironmentSettings, Hdri, HdriError, load_hdri, sky_pixels};
 pub use fog::FogSettings;
+pub use gi::{GiDebugView, GiGatherResolution, GiSettings};
 pub use hdr::HdrSettings;
 pub use hierarchy::{
     Hierarchy, HierarchyError, can_reparent, despawn_recursive, ensure_current, is_transform_root,
@@ -77,13 +80,14 @@ pub use present::{PresentSettings, VsyncMode};
 pub use previews::{
     AssetPreviews, MaterialPreview, MeshPreview, apply_material_edits, render_mesh,
 };
+pub use ray_tracing::{RayDebugView, RayTracingSettings};
 pub use registry::register_components;
 pub use render_settings::RenderSettings;
 pub use shadow::{MAX_SHADOW_SHARPNESS, MAX_SUN_ANGLE, ShadowDebugView, ShadowSettings};
 pub use ssao::SsaoSettings;
 pub use ssr::SsrSettings;
 pub use subsurface::SubsurfaceSettings;
-pub use taa::TaaSettings;
+pub use taa::{TaaSettings, Upscaler, UpscalerStatus, Upscaling};
 pub use time::{Time, advance_time};
 pub use transform::Transform;
 pub use transparency::{RefractionSettings, TransparencySettings};

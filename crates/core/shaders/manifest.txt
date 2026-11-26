@@ -12,6 +12,7 @@ dof_prefilter_comp compute dof_prefilter.comp
 dof_tile_max_comp compute dof_tile_max.comp
 equirect_to_cube_frag fragment equirect_to_cube.frag
 fog_integrate_comp compute fog_integrate.comp
+fog_light_comp compute fog_light.comp ORRIN_FLAT_SURFACE=1
 fog_scatter_comp compute fog_scatter.comp
 forward_frag fragment forward.frag
 forward_frag_alpha_test fragment forward.frag ORRIN_ALPHA_TEST=1
@@ -23,6 +24,14 @@ forward_frag_alpha_test_flat fragment forward.frag ORRIN_ALPHA_TEST=1 ORRIN_FLAT
 forward_sss_frag_flat fragment forward_sss.frag ORRIN_FLAT_SURFACE=1
 forward_sss_frag_alpha_test_flat fragment forward_sss.frag ORRIN_ALPHA_TEST=1 ORRIN_FLAT_SURFACE=1
 fullscreen_vert vertex fullscreen.vert
+gi_cache_compact_comp compute gi_cache_compact.comp
+gi_cache_shade_comp compute gi_cache_shade.comp ORRIN_FLAT_SURFACE=1
+gi_gather_comp compute gi_gather.comp ORRIN_FLAT_SURFACE=1
+gi_gather_blur_comp compute gi_gather_blur.comp
+gi_gather_temporal_comp compute gi_gather_temporal.comp
+gi_gather_upscale_comp compute gi_gather_upscale.comp
+gi_trace_comp compute gi_trace.comp ORRIN_FLAT_SURFACE=1
+gi_update_comp compute gi_update.comp
 gizmo_frag fragment gizmo.frag
 gizmo_vert vertex gizmo.vert
 hiz_build_comp compute hiz_build.comp
@@ -42,11 +51,14 @@ outline_mask_frag fragment outline_mask.frag
 outline_mask_vert vertex outline_mask.vert
 overlay_frag fragment overlay.frag
 overlay_vert vertex overlay.vert
+ray_debug_frag fragment ray_debug.frag
+path_trace_comp compute path_trace.comp ORRIN_FLAT_SURFACE=1
 prefilter_cube_frag fragment prefilter_cube.frag
 prepass_frag fragment prepass.frag
 prepass_frag_masked fragment prepass.frag ORRIN_MASKED=1
 prepass_frag_custom_surface fragment prepass.frag ORRIN_CUSTOM_SURFACE=1
 prepass_vert vertex prepass.vert
+reactive_mask_frag fragment reactive_mask.frag
 refraction_frag fragment refraction.frag
 refraction_composite_comp compute refraction_composite.comp
 shadow_frag fragment shadow.frag
@@ -61,14 +73,19 @@ skybox_vert vertex skybox.vert
 ssao_frag fragment ssao.frag
 ssao_blur_frag fragment ssao_blur.frag
 ssr_resolve_comp compute ssr_resolve.comp
+ssr_resolve_comp_traced compute ssr_resolve.comp ORRIN_RAY_FALLBACK=1 ORRIN_FLAT_SURFACE=1
 ssr_trace_comp compute ssr_trace.comp
+ssr_trace_comp_traced compute ssr_trace.comp ORRIN_RAY_FALLBACK=1 ORRIN_FLAT_SURFACE=1
 sss_blur_comp compute sss_blur.comp
 sss_composite_comp compute sss_composite.comp
 taa_resolve_comp compute taa_resolve.comp
+taa_resolve_comp_upscale compute taa_resolve.comp ORRIN_TAA_UPSCALE=1
 tonemap_frag fragment tonemap.frag
 ui_frag fragment ui.frag
 ui_vert vertex ui.vert
 ui_shape_frag fragment ui_shape.frag
 ui_shape_vert vertex ui_shape.vert
+upscaler_exposure_comp compute upscaler_exposure.comp
 wireframe_frag fragment wireframe.frag
+wireframe_frag_sampled fragment wireframe.frag ORRIN_WIREFRAME_SAMPLED_DEPTH=1
 wireframe_vert vertex wireframe.vert

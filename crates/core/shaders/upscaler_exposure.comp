@@ -1,0 +1,25 @@
+#version 460
+
+// The exposure the tonemap multiplies this frame by, into the 1x1 image a
+// vendor's upscaler reads it from next frame. The same choice `tonemap.frag`
+// makes, so the upscaler and the picture are exposed alike.
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Exposure {
+    float exposure;
+    float average_luminance;
+    float ev100;
+} metered;
+
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D u_exposure;
+
+layout(push_constant) uniform Push {
+    float manual_exposure;
+    uint use_auto;
+} push;
+
+void main() {
+    float exposure = push.use_auto != 0 ? metered.exposure : push.manual_exposure;
+    imageStore(u_exposure, ivec2(0), vec4(exposure));
+}

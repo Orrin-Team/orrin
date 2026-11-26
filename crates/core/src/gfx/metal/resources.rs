@@ -43,6 +43,7 @@ impl MtlDriver {
             // engine renders to.
             Feature::CoverageTexture => true,
             Feature::BlockCompression => self.device.supportsBCTextureCompression(),
+            Feature::RayTracing => false,
         }
     }
 

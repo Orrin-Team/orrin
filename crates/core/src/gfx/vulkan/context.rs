@@ -10,13 +10,13 @@ use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags,
 };
-use vulkano::instance::Instance;
+use vulkano::instance::{Instance, InstanceExtensions};
 use vulkano::memory::MemoryHeapFlags;
 use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::pipeline::cache::PipelineCache;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::swapchain::Surface;
-use vulkano::{Version, VulkanObject};
+use vulkano::{Version, VulkanLibrary, VulkanObject};
 
 use super::convert::vk_format;
 use super::descriptors::DescriptorCache;
@@ -92,6 +92,18 @@ pub struct VkContext {
     /// draw the opaque queue, and the renderer refuses it at startup — see
     /// `require_gpu_culling`.
     pub multi_draw: bool,
+    /// Whether a shader can trace a ray against the scene: acceleration
+    /// structures, built on the device, and ray queries from any stage.
+    ///
+    /// The one switch everything ray traced is gated on. Without it no
+    /// acceleration structure is built, no pass that traces is registered, and
+    /// the frame is the one this renderer drew before any of it existed — see
+    /// [`probe_ray_tracing`].
+    pub ray_tracing: bool,
+    /// Whether the device was made with what NGX asks of it, and why not:
+    /// see [`dlss_requirements`].
+    #[cfg(all(feature = "dlss", windows))]
+    pub(super) dlss: Result<(), Arc<str>>,
 }
 
 impl VkContext {
@@ -248,6 +260,38 @@ impl VkContext {
 
         let samples_bc = physical_device.supported_features().texture_compression_bc;
 
+        let ray_tracing = probe_ray_tracing(&physical_device);
+        if ray_tracing {
+            device_extensions.khr_acceleration_structure = true;
+            device_extensions.khr_ray_query = true;
+            // Never used: the builds are recorded, not deferred to host threads.
+            // `VK_KHR_acceleration_structure` names it as a dependency.
+            device_extensions.khr_deferred_host_operations = true;
+        }
+        tracing::info!(
+            "ray tracing: {}",
+            if ray_tracing {
+                "acceleration structures and ray queries"
+            } else {
+                "off, the frame is rasterised alone"
+            },
+        );
+
+        #[cfg(all(feature = "fsr", windows))]
+        let vendor_features = {
+            let (extensions, features) = upscaler_features(&physical_device);
+            device_extensions = device_extensions.union(&extensions);
+            features
+        };
+        #[cfg(not(all(feature = "fsr", windows)))]
+        let vendor_features = DeviceFeatures::empty();
+        #[cfg(all(feature = "dlss", windows))]
+        let mut dlss = dlss_requirements(&physical_device);
+        #[cfg(all(feature = "dlss", windows))]
+        let ngx_extensions = dlss.as_ref().copied().unwrap_or_default();
+        #[cfg(not(all(feature = "dlss", windows)))]
+        let ngx_extensions = DeviceExtensions::empty();
+
         // Graphics first, then the compute-only family, then a transfer family
         // of its own — so `queues` yields them in that order. A transfer queue
         // in the compute family is that family's second queue, and comes out
@@ -262,7 +306,7 @@ impl VkContext {
                 None => families.push((family, 1)),
             }
         }
-        let queue_create_infos = families
+        let queue_create_infos: Vec<QueueCreateInfo> = families
             .iter()
             .map(|&(queue_family_index, count)| QueueCreateInfo {
                 queue_family_index,
@@ -271,27 +315,49 @@ impl VkContext {
             })
             .collect();
 
-        let (device, mut queues) = Device::new(
-            physical_device,
-            DeviceCreateInfo {
-                queue_create_infos,
-                enabled_extensions: device_extensions,
-                enabled_features: DeviceFeatures {
-                    image_view_format_swizzle: swizzle,
-                    sampler_anisotropy: anisotropy,
-                    independent_blend: true,
-                    descriptor_binding_partially_bound: partially_bound,
-                    multi_draw_indirect: multi_draw,
-                    draw_indirect_first_instance: multi_draw,
-                    dynamic_rendering: true,
-                    synchronization2: true,
-                    texture_compression_bc: samples_bc,
-                    ..DeviceFeatures::empty()
+        let enabled_features = DeviceFeatures {
+            image_view_format_swizzle: swizzle,
+            sampler_anisotropy: anisotropy,
+            independent_blend: true,
+            descriptor_binding_partially_bound: partially_bound,
+            multi_draw_indirect: multi_draw,
+            draw_indirect_first_instance: multi_draw,
+            dynamic_rendering: true,
+            synchronization2: true,
+            texture_compression_bc: samples_bc,
+            acceleration_structure: ray_tracing,
+            ray_query: ray_tracing,
+            buffer_device_address: ray_tracing,
+            shader_sampled_image_array_non_uniform_indexing: ray_tracing,
+            ..DeviceFeatures::empty()
+        }
+        .union(&vendor_features);
+        let create = |enabled_extensions| {
+            Device::new(
+                physical_device.clone(),
+                DeviceCreateInfo {
+                    queue_create_infos: queue_create_infos.clone(),
+                    enabled_extensions,
+                    enabled_features,
+                    ..Default::default()
                 },
-                ..Default::default()
-            },
-        )
-        .expect("failed to create device");
+            )
+        };
+        // NGX's extensions are not the engine's to vouch for, so a device that
+        // cannot be made with them is made without, and DLSS says why.
+        let (device, mut queues) = match create(device_extensions.union(&ngx_extensions)) {
+            Ok(made) => made,
+            Err(e) if ngx_extensions != DeviceExtensions::empty() => {
+                let reason = format!("the device could not be made with NGX's extensions: {e}");
+                tracing::warn!("DLSS: {reason}");
+                #[cfg(all(feature = "dlss", windows))]
+                {
+                    dlss = Err(Arc::from(reason));
+                }
+                create(device_extensions).expect("failed to create device")
+            }
+            Err(e) => panic!("failed to create device: {e:?}"),
+        };
 
         let queue = queues.next().unwrap();
         let compute_queue = compute_family.map(|_| {
@@ -353,6 +419,9 @@ impl VkContext {
             pipelines,
             partially_bound,
             multi_draw,
+            ray_tracing,
+            #[cfg(all(feature = "dlss", windows))]
+            dlss: dlss.map(|_| ()),
         }
     }
 
@@ -460,6 +529,157 @@ fn select_compute_family(physical_device: &Arc<PhysicalDevice>) -> Option<u32> {
                 && family.queue_count > 0
         })
         .map(|index| index as u32)
+}
+
+/// What FSR's shaders declare, as far as the device has it: the runtime
+/// builds its pipelines on the engine's device, so the device has to have been
+/// made with what they use. Half and byte arithmetic, sixteen-bit storage, a
+/// fixed subgroup size, cooperative matrices and the Vulkan memory model; none
+/// of the engine's own shaders uses any of them.
+///
+/// Not all of it: FSR 4's shaders also declare `SPV_EXT_float8` and
+/// `SPV_NV_cooperative_matrix2`, whose extensions vulkano 0.35 cannot name,
+/// so a device made through it cannot enable them.
+#[cfg(all(feature = "fsr", windows))]
+fn upscaler_features(physical_device: &PhysicalDevice) -> (DeviceExtensions, DeviceFeatures) {
+    let supported = physical_device.supported_extensions();
+    let extensions = DeviceExtensions {
+        khr_cooperative_matrix: supported.khr_cooperative_matrix,
+        ..DeviceExtensions::empty()
+    };
+    let wanted = DeviceFeatures {
+        shader_float16: true,
+        shader_int8: true,
+        shader_int16: true,
+        storage_buffer16_bit_access: true,
+        uniform_and_storage_buffer16_bit_access: true,
+        storage_buffer8_bit_access: true,
+        variable_pointers: true,
+        variable_pointers_storage_buffer: true,
+        vulkan_memory_model: true,
+        vulkan_memory_model_device_scope: true,
+        subgroup_size_control: true,
+        compute_full_subgroups: true,
+        shader_integer_dot_product: true,
+        shader_demote_to_helper_invocation: true,
+        shader_storage_image_write_without_format: true,
+        shader_storage_image_read_without_format: true,
+        cooperative_matrix: supported.khr_cooperative_matrix,
+        ..DeviceFeatures::empty()
+    };
+    (
+        extensions,
+        wanted.intersection(physical_device.supported_features()),
+    )
+}
+
+/// The instance extensions a vendor's upscaler asks for, as far as the Vulkan
+/// library has them: what every instance the engine draws through is made
+/// with.
+///
+/// Only DLSS asks, and NGX has to be asked before there is an instance, so
+/// before the device's vendor can be known; the query needs neither (DLSS
+/// programming guide §2.3.1). What the library lacks is left out here, and
+/// [`dlss_requirements`] names it when the device is made.
+#[cfg_attr(not(all(feature = "dlss", windows)), allow(unused_variables))]
+pub fn upscaler_instance_extensions(library: &VulkanLibrary) -> InstanceExtensions {
+    #[cfg(all(feature = "dlss", windows))]
+    match super::dlss::instance_extensions() {
+        Ok(names) => {
+            tracing::info!("DLSS: NGX asks the instance for {names:?}");
+            return InstanceExtensions::from_iter(names.iter().map(String::as_str))
+                .intersection(library.supported_extensions());
+        }
+        Err(reason) => tracing::info!("DLSS: NGX's instance query failed: {reason}"),
+    }
+    InstanceExtensions::empty()
+}
+
+/// The device extensions NGX asks of `physical_device` for DLSS, or why DLSS
+/// cannot run on it.
+///
+/// NGX is asked only of an NVIDIA device; of any other the reason is the
+/// vendor. The device is made through vulkano 0.35, so an extension it cannot
+/// name cannot be enabled, and DLSS reports it rather than the device being
+/// made some other way. The instance's half is checked here too, against what
+/// the instance was made with, since an instance made without
+/// [`upscaler_instance_extensions`] never asked.
+#[cfg(all(feature = "dlss", windows))]
+fn dlss_requirements(physical_device: &Arc<PhysicalDevice>) -> Result<DeviceExtensions, Arc<str>> {
+    use super::dlss;
+
+    let properties = physical_device.properties();
+    if properties.vendor_id != dlss::NVIDIA {
+        return Err(Arc::from(format!(
+            "DLSS runs on NVIDIA RTX GPUs only, and this is {}",
+            properties.device_name
+        )));
+    }
+    let made_with = physical_device.instance().enabled_extensions();
+    let names = dlss::instance_extensions()
+        .map_err(|reason| Arc::from(format!("NGX's instance query failed: {reason}")))?;
+    for name in names {
+        let wanted = InstanceExtensions::from_iter([name.as_str()]);
+        if wanted.is_empty() || !made_with.contains(&wanted) {
+            return Err(Arc::from(format!(
+                "the instance was made without {name}, which NGX asks for"
+            )));
+        }
+    }
+    let names = dlss::device_extensions(physical_device)
+        .map_err(|reason| Arc::from(format!("NGX's device query failed: {reason}")))?;
+    tracing::info!("DLSS: NGX asks the device for {names:?}");
+    let supported = physical_device.supported_extensions();
+    let mut extensions = DeviceExtensions::empty();
+    for name in names {
+        let wanted = DeviceExtensions::from_iter([name.as_str()]);
+        if wanted.is_empty() {
+            return Err(Arc::from(format!(
+                "NGX asks for {name}, which vulkano 0.35 cannot enable"
+            )));
+        }
+        if !supported.contains(&wanted) {
+            return Err(Arc::from(format!(
+                "NGX asks for {name}, which this device does not have"
+            )));
+        }
+        extensions = extensions.union(&wanted);
+    }
+    Ok(extensions)
+}
+
+/// Whether the device can build acceleration structures and trace ray queries
+/// against them, or `false` under `ORRIN_RAY_TRACING=0`.
+///
+/// Ray queries and not ray-tracing pipelines: a query is traced inline from the
+/// compute dispatches the frame already is, with no shader binding table and no
+/// recursion, so `VK_KHR_ray_tracing_pipeline` is neither asked for nor enabled.
+///
+/// Vulkan 1.2 is the floor because that is where buffer device addresses are
+/// core, and an acceleration structure is built from addresses rather than from
+/// bound buffers. A device below it, or one missing either extension — MoltenVK,
+/// lavapipe, an integrated part from before 2020 — reports `false` and is drawn
+/// for exactly as it was.
+fn probe_ray_tracing(physical_device: &Arc<PhysicalDevice>) -> bool {
+    // The control every ray-traced feature is measured against, and the way to
+    // run the fallback on a machine that has the hardware.
+    if std::env::var("ORRIN_RAY_TRACING").is_ok_and(|value| value.trim() == "0") {
+        return false;
+    }
+    let extensions = physical_device.supported_extensions();
+    let features = physical_device.supported_features();
+    physical_device.api_version() >= Version::V1_2
+        && extensions.khr_acceleration_structure
+        && extensions.khr_ray_query
+        && extensions.khr_deferred_host_operations
+        && features.acceleration_structure
+        && features.ray_query
+        && features.buffer_device_address
+        // A hit reads the maps of whichever material it lands on, which is a
+        // different texture for every ray in a dispatch: the one place in the
+        // renderer an index into the texture array is not uniform across a
+        // draw.
+        && features.shader_sampled_image_array_non_uniform_indexing
 }
 
 /// The device's queue families, read for [`transfer_slot`].

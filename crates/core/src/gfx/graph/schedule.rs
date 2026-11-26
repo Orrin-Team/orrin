@@ -132,6 +132,7 @@ const COMPUTE_QUEUE_STAGES: PipelineStages = PipelineStages::TOP_OF_PIPE
     .union(PipelineStages::DRAW_INDIRECT)
     .union(PipelineStages::COMPUTE_SHADER)
     .union(PipelineStages::ALL_TRANSFER)
+    .union(PipelineStages::ACCELERATION_STRUCTURE_BUILD)
     .union(PipelineStages::BOTTOM_OF_PIPE)
     .union(PipelineStages::HOST)
     .union(PipelineStages::ALL_COMMANDS);
